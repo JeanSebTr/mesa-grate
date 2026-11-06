@@ -31,7 +31,7 @@
 
 #include "private.h"
 
-static simple_mtx_t table_lock = _SIMPLE_MTX_INITIALIZER_NP;
+static simple_mtx_t table_lock = SIMPLE_MTX_INITIALIZER;
 
 /* lookup a buffer, call with table_lock mutex locked */
 static struct drm_tegra_bo * lookup_bo(void *table, uint32_t key)

@@ -346,11 +346,11 @@ emit_tgsi_instr(struct grate_fp_shader *fp, const struct tgsi_full_instruction *
          emit_modulate_tex_temp(fp, &inst->Dst[0].Register, b);
          break;
       }
-      unreachable("unsupported MUL form");
+      UNREACHABLE("unsupported MUL form");
    }
 
    default:
-      unreachable("unsupported TGSI-opcode!");
+      UNREACHABLE("unsupported TGSI-opcode!");
    }
 }
 

@@ -136,8 +136,16 @@ if with_gallium_v3d
 else
   driver_v3d = declare_dependency()
 endif
-if with_gallium_tegra
+if with_gallium_grate
   subdir('winsys/tegra/drm')
+  subdir('drivers/grate')
+else
+  driver_grate = declare_dependency()
+endif
+if with_gallium_tegra
+  if not with_gallium_grate
+    subdir('winsys/tegra/drm')
+  endif
   subdir('drivers/tegra')
 else
   driver_tegra = declare_dependency()

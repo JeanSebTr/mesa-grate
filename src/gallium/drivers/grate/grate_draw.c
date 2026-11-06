@@ -20,32 +20,32 @@
 #include "host1x01_hardware.h"
 
 static int
-grate_primitive_type(enum pipe_prim_type mode)
+grate_primitive_type(enum mesa_prim mode)
 {
    switch (mode) {
-   case PIPE_PRIM_POINTS:
+   case MESA_PRIM_POINTS:
       return TGR3D_PRIMITIVE_TYPE_POINTS;
 
-   case PIPE_PRIM_LINES:
+   case MESA_PRIM_LINES:
       return TGR3D_PRIMITIVE_TYPE_LINES;
 
-   case PIPE_PRIM_LINE_LOOP:
+   case MESA_PRIM_LINE_LOOP:
       return TGR3D_PRIMITIVE_TYPE_LINE_LOOP;
 
-   case PIPE_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_STRIP:
       return TGR3D_PRIMITIVE_TYPE_LINE_STRIP;
 
-   case PIPE_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLES:
       return TGR3D_PRIMITIVE_TYPE_TRIANGLES;
 
-   case PIPE_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_STRIP:
       return TGR3D_PRIMITIVE_TYPE_TRIANGLE_STRIP;
 
-   case PIPE_PRIM_TRIANGLE_FAN:
+   case MESA_PRIM_TRIANGLE_FAN:
       return TGR3D_PRIMITIVE_TYPE_TRIANGLE_FAN;
 
    default:
-      unreachable("unexpected enum pipe_prim_type");
+      UNREACHABLE("unexpected enum mesa_prim");
    }
 }
 
@@ -308,7 +308,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
    if (!indirect && (!draws[0].count || !info->instance_count))
       return;
 
-   if (info->mode >= PIPE_PRIM_QUADS) {
+   if (info->mode >= MESA_PRIM_QUADS) {
       // the HW can handle non-trimmed sizes, but pimconvert can't
       if (!u_trim_pipe_prim(info->mode, (unsigned*)&draws[0].count))
          return;

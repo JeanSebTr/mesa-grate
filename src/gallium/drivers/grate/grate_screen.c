@@ -2,6 +2,11 @@
 
 #include "drm-uapi/drm_fourcc.h"
 
+#include <inttypes.h>
+#include <xf86drm.h>
+
+#include "compiler/nir/nir.h"
+#include "util/os_file.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 
@@ -52,522 +57,143 @@ grate_screen_get_device_vendor(struct pipe_screen *pscreen)
    return "NVIDIA";
 }
 
-static int
-grate_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
+/* Total CMA, which is where every GR3D buffer lives. */
+static bool
+grate_get_total_cma(uint64_t *size)
 {
-   switch (param) {
-   case PIPE_CAP_CLEAR_SCISSORED:
-      return 1;
-
-   case PIPE_CAP_NPOT_TEXTURES:
-      return 1; /* not really, but mesa requires it for now! */
-
-   case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
-      return 0; /* ??? */
-
-   case PIPE_CAP_ANISOTROPIC_FILTER:
-      return 0;
-
-   case PIPE_CAP_POINT_SPRITE:
-      return 1;
-
-   case PIPE_CAP_MAX_RENDER_TARGETS:
-      return 8; /* ??? */
-
-   case PIPE_CAP_OCCLUSION_QUERY:
-      return 0; /* ??? */
-
-   case PIPE_CAP_QUERY_TIME_ELAPSED:
-      return 0; /* ??? - can we use syncpts for this? */
-
-   case PIPE_CAP_TEXTURE_SWIZZLE:
-      return 0;
-
-   case PIPE_CAP_MAX_TEXTURE_2D_SIZE:
-      return 2048;
-
-   case PIPE_CAP_MAX_TEXTURE_3D_LEVELS:
-      return 0;
-
-   case PIPE_CAP_MAX_TEXTURE_CUBE_LEVELS:
-      return 16; /* ??? */
-
-   case PIPE_CAP_SUPPORTED_PRIM_MODES_WITH_RESTART:
-      return 0;
-
-   case PIPE_CAP_SUPPORTED_PRIM_MODES:
-      return BITFIELD_BIT(PIPE_PRIM_TRIANGLES);
-
-   case PIPE_CAP_TEXTURE_MIRROR_CLAMP:
-      return 0;
-
-   case PIPE_CAP_BLEND_EQUATION_SEPARATE:
-      return 1;
-
-   case PIPE_CAP_FRAGMENT_SHADER_TEXTURE_LOD:
-   case PIPE_CAP_FRAGMENT_SHADER_DERIVATIVES:
-      return 1; /* well, not quite. but perhaps close enough? */
-
-   case PIPE_CAP_MAX_STREAM_OUTPUT_BUFFERS:
-      return 0;
-
-   case PIPE_CAP_PRIMITIVE_RESTART:
-   case PIPE_CAP_PRIMITIVE_RESTART_FIXED_INDEX:
-      return 0; /* probably possible to do by splitting draws, but not sure */
-
-   case PIPE_CAP_INDEP_BLEND_ENABLE:
-      return 0; /* ??? */
-
-   case PIPE_CAP_INDEP_BLEND_FUNC:
-      return 0; /* ??? */
-
-   case PIPE_CAP_MAX_TEXTURE_ARRAY_LAYERS:
-      return 0;
-
-   case PIPE_CAP_DEPTH_CLIP_DISABLE:
-      return 0; /* ??? */
-
-   case PIPE_CAP_SHADER_STENCIL_EXPORT:
-      return 0; /* ??? */
-
-   case PIPE_CAP_VS_INSTANCEID:
-   case PIPE_CAP_VERTEX_ELEMENT_INSTANCE_DIVISOR:
-      return 0;
-
-   case PIPE_CAP_FRAGMENT_COLOR_CLAMPED:
-      return 0; /* probably not */
-
-   case PIPE_CAP_SEAMLESS_CUBE_MAP:
-   case PIPE_CAP_SEAMLESS_CUBE_MAP_PER_TEXTURE:
-      return 0; /* probably not */
-
-   case PIPE_CAP_MIN_TEXEL_OFFSET:
-   case PIPE_CAP_MAX_TEXEL_OFFSET:
-      return 0;
-
-   case PIPE_CAP_CONDITIONAL_RENDER:
-      return 0; /* probably not */
-
-   case PIPE_CAP_TEXTURE_BARRIER:
-      return 0; /* no clue */
-
-   case PIPE_CAP_MAX_STREAM_OUTPUT_SEPARATE_COMPONENTS:
-   case PIPE_CAP_MAX_STREAM_OUTPUT_INTERLEAVED_COMPONENTS:
-   case PIPE_CAP_STREAM_OUTPUT_PAUSE_RESUME:
-      return 0;
-
-   case PIPE_CAP_TGSI_CAN_COMPACT_CONSTANTS:
-      return 0; /* probably */
-
-   case PIPE_CAP_VERTEX_COLOR_UNCLAMPED:
-      return 1; /* probably irrelevant for GLES2 */
-
-   case PIPE_CAP_VERTEX_COLOR_CLAMPED:
-      return 0; /* probably irrelevant for GLES2 */
-
-   case PIPE_CAP_GLSL_FEATURE_LEVEL:
-      return 120; /* no clue */
-
-   case PIPE_CAP_QUADS_FOLLOW_PROVOKING_VERTEX_CONVENTION:
-      return 0; /* no idea, need to test */
-
-   case PIPE_CAP_USER_VERTEX_BUFFERS:
-      return 0; /* probably possible, but nasty for kernel */
-
-   case PIPE_CAP_VERTEX_BUFFER_OFFSET_4BYTE_ALIGNED_ONLY:
-   case PIPE_CAP_VERTEX_BUFFER_STRIDE_4BYTE_ALIGNED_ONLY:
-   case PIPE_CAP_VERTEX_ELEMENT_SRC_OFFSET_4BYTE_ALIGNED_ONLY:
-      return 0;
-
-   case PIPE_CAP_CONSTANT_BUFFER_OFFSET_ALIGNMENT:
-      return 4; /* DWORD aligned, can do pure data GATHER */
-
-   case PIPE_CAP_START_INSTANCE:
-      return 0;
-
-   case PIPE_CAP_QUERY_TIMESTAMP:
-      return 0; /* dunno */
-
-   case PIPE_CAP_BUFFER_SAMPLER_VIEW_RGBA_ONLY:
-      return 0;
-
-   case PIPE_CAP_MIN_MAP_BUFFER_ALIGNMENT:
-      return 0;
-
-   case PIPE_CAP_CUBE_MAP_ARRAY:
-      return 0;
-
-   case PIPE_CAP_TEXTURE_BUFFER_OBJECTS:
-   case PIPE_CAP_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
-   case PIPE_CAP_MAX_TEXEL_BUFFER_ELEMENTS_UINT:
-      return 0;
-
-   case PIPE_CAP_TGSI_TEXCOORD:
-      return 0;
-
-   case PIPE_CAP_TEXTURE_TRANSFER_MODES:
-      return 1;
-
-   case PIPE_CAP_COMPUTE:
-   case PIPE_CAP_TEXTURE_MULTISAMPLE:
-   case PIPE_CAP_QUERY_PIPELINE_STATISTICS:
-   case PIPE_CAP_TEXTURE_BORDER_COLOR_QUIRK:
-      return 0;
-
-   case PIPE_CAP_MAX_VIEWPORTS:
-      return 1;
-
-   case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
-      return 1;
-
-   case PIPE_CAP_MAX_GEOMETRY_OUTPUT_VERTICES:
-   case PIPE_CAP_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS:
-   case PIPE_CAP_MAX_VERTEX_STREAMS:
-      return 0;
-
-   case PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS:
-   case PIPE_CAP_MIN_TEXTURE_GATHER_OFFSET:
-   case PIPE_CAP_MAX_TEXTURE_GATHER_OFFSET:
-   case PIPE_CAP_BUFFER_MAP_PERSISTENT_COHERENT: /* dunno */
-   case PIPE_CAP_TEXTURE_QUERY_LOD:
-   case PIPE_CAP_SAMPLE_SHADING:
-      return 0;
-
-   case PIPE_CAP_DRAW_INDIRECT:
-   case PIPE_CAP_FS_FINE_DERIVATIVE:
-      return 0;
-
-   case PIPE_CAP_VENDOR_ID:
-      return 0x10de;
-
-   case PIPE_CAP_DEVICE_ID:
-      return 0xFFFFFFFF;
-
-   case PIPE_CAP_ACCELERATED:
-      return 1;
-
-   case PIPE_CAP_VIDEO_MEMORY: {
-      uint64_t system_memory;
-
-      if (!os_get_total_cma(&system_memory))
-         return 0;
-
-      return (int)(system_memory >> 20);
-   }
-
-   case PIPE_CAP_UMA:
-      return 1;
-
-   case PIPE_CAP_CONDITIONAL_RENDER_INVERTED:
-      return 0; /* no support, shouldn't matter */
-
-   case PIPE_CAP_MAX_VERTEX_ATTRIB_STRIDE:
-      return (1 << 24) - 1;
-
-   case PIPE_CAP_SAMPLER_VIEW_TARGET:
-   case PIPE_CAP_CLIP_HALFZ:
-   case PIPE_CAP_POLYGON_OFFSET_CLAMP:
-   case PIPE_CAP_RESOURCE_FROM_USER_MEMORY:
-   case PIPE_CAP_DEVICE_RESET_STATUS_QUERY:
-      return 0;
-
-   case PIPE_CAP_MAX_SHADER_PATCH_VARYINGS:
-      return 0;
-
-   case PIPE_CAP_TEXTURE_FLOAT_LINEAR:
-   case PIPE_CAP_TEXTURE_HALF_FLOAT_LINEAR:
-   case PIPE_CAP_DEPTH_BOUNDS_TEST:
-   case PIPE_CAP_TEXTURE_QUERY_SAMPLES:
-      return 0;
-
-   case PIPE_CAP_SHAREABLE_SHADERS:
-      return 1;
-
-   case PIPE_CAP_COPY_BETWEEN_COMPRESSED_AND_PLAIN_FORMATS:
-   case PIPE_CAP_CLEAR_TEXTURE: /* might be possible */
-   case PIPE_CAP_DRAW_PARAMETERS:
-   case PIPE_CAP_SHADER_PACK_HALF_FLOAT:
-   case PIPE_CAP_MULTI_DRAW_INDIRECT:
-   case PIPE_CAP_MULTI_DRAW_INDIRECT_PARAMS:
-      return 0;
-
-   case PIPE_CAP_FS_POSITION_IS_SYSVAL:
-   case PIPE_CAP_FS_FACE_IS_INTEGER_SYSVAL:
-      return 0; /* not really sure about these */
-
-   case PIPE_CAP_SHADER_BUFFER_OFFSET_ALIGNMENT:
-   case PIPE_CAP_INVALIDATE_BUFFER: /* not sure */
-   case PIPE_CAP_STRING_MARKER:
-   case PIPE_CAP_SURFACE_REINTERPRET_BLOCKS: /* can probably be supported */
-   case PIPE_CAP_QUERY_BUFFER_OBJECT:
-   case PIPE_CAP_QUERY_MEMORY_INFO:
-   case PIPE_CAP_FRAMEBUFFER_NO_ATTACHMENT: /* not sure */
-   case PIPE_CAP_ROBUST_BUFFER_ACCESS_BEHAVIOR: /* probably not */
-   case PIPE_CAP_CULL_DISTANCE: /* don't know */
-   case PIPE_CAP_SHADER_GROUP_VOTE:
-   case PIPE_CAP_MAX_WINDOW_RECTANGLES:
-      return 0;
-
-   case PIPE_CAP_VIEWPORT_SUBPIXEL_BITS:
-      return 4; /* minimum for GLES 2.0, might be more */
-
-   case PIPE_CAP_MIXED_COLOR_DEPTH_BITS:
-      return 1; /* probably true ? */
-
-   case PIPE_CAP_MIXED_COLORBUFFER_FORMATS:
-      return 1; /* can't see why not... */
-
-   case PIPE_CAP_STREAM_OUTPUT_INTERLEAVE_BUFFERS:
-   case PIPE_CAP_FBFETCH: /* supported, but let's enable later */
-   case PIPE_CAP_TEXTURE_GATHER_OFFSETS:
-   case PIPE_CAP_DOUBLES:
-   case PIPE_CAP_INT64:
-   case PIPE_CAP_INT64_DIVMOD:
-   case PIPE_CAP_SHADER_CAN_READ_OUTPUTS:
-   case PIPE_CAP_TGSI_TEX_TXF_LZ:
-   case PIPE_CAP_SHADER_CLOCK:
-   case PIPE_CAP_POLYGON_MODE_FILL_RECTANGLE:
-   case PIPE_CAP_SPARSE_BUFFER_PAGE_SIZE:
-   case PIPE_CAP_SHADER_BALLOT:
-   case PIPE_CAP_NATIVE_FENCE_FD:
-   case PIPE_CAP_CAN_BIND_CONST_BUFFER_AS_VERTEX:
-   case PIPE_CAP_ALLOW_MAPPED_BUFFERS_DURING_EXECUTION:
-   case PIPE_CAP_POST_DEPTH_COVERAGE:
-   case PIPE_CAP_BINDLESS_TEXTURE:
-   case PIPE_CAP_QUERY_SO_OVERFLOW:
-   case PIPE_CAP_MEMOBJ:
-   case PIPE_CAP_LOAD_CONSTBUF:
-   case PIPE_CAP_TILE_RASTER_ORDER:
-   case PIPE_CAP_MAX_COMBINED_SHADER_OUTPUT_RESOURCES:
-   case PIPE_CAP_SIGNED_VERTEX_BUFFER_OFFSET:
-      return 0;
-
-   case PIPE_CAP_MAX_VARYINGS:
-      return 16;
-
-   default:
-      return u_pipe_screen_get_param_defaults(pscreen, param);
-   }
+   char *meminfo = os_read_file("/proc/meminfo", NULL);
+   if (!meminfo)
+      return false;
+
+   uint64_t kb = 0;
+   char *str = strstr(meminfo, "CmaTotal:");
+   bool ok = str && sscanf(str, "CmaTotal: %" SCNu64, &kb) == 1 && kb;
+   free(meminfo);
+
+   *size = kb << 10;
+   return ok;
 }
 
-static float
-grate_screen_get_paramf(struct pipe_screen *pscreen,
-                        enum pipe_capf param)
+static void
+grate_init_screen_caps(struct pipe_screen *pscreen)
 {
-   switch (param) {
-   case PIPE_CAPF_MIN_LINE_WIDTH:
-   case PIPE_CAPF_MIN_LINE_WIDTH_AA:
-   case PIPE_CAPF_MIN_POINT_SIZE:
-   case PIPE_CAPF_MIN_POINT_SIZE_AA:
-      return 1;
-   case PIPE_CAPF_POINT_SIZE_GRANULARITY:
-   case PIPE_CAPF_LINE_WIDTH_GRANULARITY:
-      return 0.1f;
-   case PIPE_CAPF_MAX_LINE_WIDTH:
-   case PIPE_CAPF_MAX_LINE_WIDTH_AA:
-   case PIPE_CAPF_MAX_POINT_SIZE:
-   case PIPE_CAPF_MAX_POINT_SIZE_AA:
-      return 8192.0f; /* no clue */
+   struct pipe_caps *caps = (struct pipe_caps *)&pscreen->caps;
 
-   case PIPE_CAPF_MAX_TEXTURE_ANISOTROPY:
-      return 0.0f;
+   u_init_pipe_screen_caps(pscreen, 1);
 
-   case PIPE_CAPF_MAX_TEXTURE_LOD_BIAS:
-      return 16.0f;
+   caps->clear_scissored = true;
+   caps->npot_textures = true; /* not really, but mesa requires it for now! */
+   caps->max_render_targets = 8; /* ??? */
+   caps->max_texture_2d_size = 2048;
+   caps->max_texture_3d_levels = 0;
+   caps->max_texture_cube_levels = 16; /* ??? */
+   caps->supported_prim_modes = BITFIELD_BIT(MESA_PRIM_TRIANGLES);
+   caps->supported_prim_modes_with_restart = 0;
+   caps->blend_equation_separate = true;
+   /* well, not quite. but perhaps close enough? */
+   caps->fragment_shader_texture_lod = true;
+   caps->fragment_shader_derivatives = true;
+   caps->min_texel_offset = 0;
+   caps->max_texel_offset = 0;
+   caps->max_stream_output_separate_components = 0;
+   caps->max_stream_output_interleaved_components = 0;
+   caps->vertex_color_unclamped = true; /* probably irrelevant for GLES2 */
+   caps->glsl_feature_level = 120; /* no clue */
+   caps->constant_buffer_offset_alignment = 4; /* DWORD, pure data GATHER */
+   caps->min_map_buffer_alignment = 0;
+   caps->texture_buffer_offset_alignment = 0;
+   caps->max_texel_buffer_elements = 0;
+   caps->texture_transfer_modes = PIPE_TEXTURE_TRANSFER_BLIT;
+   caps->max_viewports = 1;
+   caps->mixed_framebuffer_sizes = true;
+   caps->buffer_map_persistent_coherent = false;
+   caps->min_texture_gather_offset = 0;
+   caps->max_texture_gather_offset = 0;
+   caps->vendor_id = 0x10de;
+   caps->device_id = 0xffffffff;
+   caps->uma = true;
+   caps->max_vertex_attrib_stride = (1 << 24) - 1;
+   caps->shareable_shaders = true;
+   caps->viewport_subpixel_bits = 4; /* minimum for GLES 2.0, might be more */
+   caps->mixed_color_depth_bits = 1;
+   caps->mixed_colorbuffer_formats = true;
+   caps->allow_mapped_buffers_during_execution = false;
+   caps->max_varyings = 16;
+   /* resource_get_handle/from_handle do both (EGL and GBM) */
+   caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
 
-   case PIPE_CAPF_MIN_CONSERVATIVE_RASTER_DILATE:
-   case PIPE_CAPF_MAX_CONSERVATIVE_RASTER_DILATE:
-   case PIPE_CAPF_CONSERVATIVE_RASTER_DILATE_GRANULARITY:
-      return 0.0f;
+   uint64_t cma;
+   caps->video_memory = grate_get_total_cma(&cma) ? cma >> 20 : 0;
 
-   default:
-      fprintf(stdout, "%s: unsupported parameter: %d\n", __func__, param);
-      return 0.0f;
-   }
+   caps->min_line_width =
+   caps->min_line_width_aa =
+   caps->min_point_size =
+   caps->min_point_size_aa = 1;
+   caps->point_size_granularity =
+   caps->line_width_granularity = 0.1f;
+   caps->max_line_width =
+   caps->max_line_width_aa =
+   caps->max_point_size =
+   caps->max_point_size_aa = 8192.0f; /* no clue */
+   caps->max_texture_lod_bias = 16.0f;
 }
 
-static int
-grate_screen_get_shader_param(struct pipe_screen *pscreen,
-                           enum pipe_shader_type shader,
-                           enum pipe_shader_cap param)
+static void
+grate_init_shader_caps(struct pipe_screen *pscreen)
 {
-   switch (shader) {
-   case PIPE_SHADER_VERTEX:
-      switch (param) {
+   struct pipe_shader_caps *caps =
+      (struct pipe_shader_caps *)&pscreen->shader_caps[MESA_SHADER_VERTEX];
 
-      case PIPE_SHADER_CAP_MAX_INSTRUCTIONS:
-      case PIPE_SHADER_CAP_MAX_ALU_INSTRUCTIONS:
-         return 1024;
+   /* no vertex texturing, no control flow */
+   caps->max_instructions =
+   caps->max_alu_instructions = 1024;
+   caps->max_inputs =
+   caps->max_outputs = 16;
+   caps->max_const_buffer0_size = 1024;
+   caps->max_const_buffers = 1;
+   caps->max_temps = 64 * 4; /* 64 vec4s */
+   caps->indirect_const_addr = true; /* can index constant registers */
+   caps->tgsi_sqrt_supported = true;
+   caps->supported_irs = (1 << PIPE_SHADER_IR_NIR) | (1 << PIPE_SHADER_IR_TGSI);
 
-      /* no vertex-texturing */
-      case PIPE_SHADER_CAP_MAX_TEX_INSTRUCTIONS:
-      case PIPE_SHADER_CAP_MAX_TEX_INDIRECTIONS:
-      case PIPE_SHADER_CAP_MAX_TEXTURE_SAMPLERS:
-      case PIPE_SHADER_CAP_MAX_SAMPLER_VIEWS:
-         return 0;
+   caps = (struct pipe_shader_caps *)&pscreen->shader_caps[MESA_SHADER_FRAGMENT];
 
-      case PIPE_SHADER_CAP_MAX_CONTROL_FLOW_DEPTH:
-      case PIPE_SHADER_CAP_CONT_SUPPORTED:
-      case PIPE_SHADER_CAP_SUBROUTINES:
-         return 0;
-
-      case PIPE_SHADER_CAP_MAX_INPUTS:
-      case PIPE_SHADER_CAP_MAX_OUTPUTS:
-         return 16;
-
-      case PIPE_SHADER_CAP_MAX_CONST_BUFFER0_SIZE:
-      case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
-         return 1024;
-
-      case PIPE_SHADER_CAP_MAX_TEMPS:
-         return 64 * 4; /* 64 vec4s */
-
-      /* cannot index attributes, varyings nor GPRs */
-      case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
-      case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
-      case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
-         return 0;
-
-      case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
-         return 1; /* can index constant registers */
-
-      case PIPE_SHADER_CAP_INTEGERS:
-      case PIPE_SHADER_CAP_MAX_SHADER_IMAGES:
-         return 0;
-
-      case PIPE_SHADER_CAP_TGSI_SQRT_SUPPORTED:
-         return 1;
-
-      case PIPE_SHADER_CAP_DROUND_SUPPORTED:
-      case PIPE_SHADER_CAP_DFRACEXP_DLDEXP_SUPPORTED:
-      case PIPE_SHADER_CAP_MAX_SHADER_BUFFERS:
-         return 0;
-
-      case PIPE_SHADER_CAP_TGSI_ANY_INOUT_DECL_RANGE:
-         return 0;
-
-      case PIPE_SHADER_CAP_SUPPORTED_IRS:
-         return 1 << PIPE_SHADER_IR_TGSI;
-
-      case PIPE_SHADER_CAP_PREFERRED_IR:
-         return PIPE_SHADER_IR_TGSI;
-
-      case PIPE_SHADER_CAP_LDEXP_SUPPORTED:
-          return 0;
-
-      case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTERS:
-      case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTER_BUFFERS:
-          return 0;
-
-      case PIPE_SHADER_CAP_FP16:
-      case PIPE_SHADER_CAP_FP16_DERIVATIVES:
-      case PIPE_SHADER_CAP_INT16:
-      case PIPE_SHADER_CAP_GLSL_16BIT_CONSTS:
-          return 0;
-
-      default:
-         fprintf(stdout, "%s: unsupported vertex-shader parameter: %d\n", __func__, param);
-         return 0;
-      }
-
-   case PIPE_SHADER_FRAGMENT:
-
-      switch (param) {
-      case PIPE_SHADER_CAP_MAX_INSTRUCTIONS:
-         return 4 * 128;
-
-      case PIPE_SHADER_CAP_MAX_ALU_INSTRUCTIONS:
-         return 4 * 128;
-
-      case PIPE_SHADER_CAP_MAX_TEX_INSTRUCTIONS:
-         return 128;
-
-      case PIPE_SHADER_CAP_MAX_TEX_INDIRECTIONS:
-         return 128;
-
-      /* no control flow */
-      case PIPE_SHADER_CAP_MAX_CONTROL_FLOW_DEPTH:
-      case PIPE_SHADER_CAP_CONT_SUPPORTED:
-      case PIPE_SHADER_CAP_SUBROUTINES:
-         return 0;
-
-      case PIPE_SHADER_CAP_MAX_INPUTS:
-      case PIPE_SHADER_CAP_MAX_OUTPUTS:
-         return 16;
-
-      case PIPE_SHADER_CAP_MAX_CONST_BUFFER0_SIZE:
-      case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
-         return 32;
-
-      case PIPE_SHADER_CAP_MAX_TEMPS:
-         return 16; /* scalars */
-
-      /* no indirection */
-      case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
-      case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
-      case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
-      case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
-         return 0;
-
-      case PIPE_SHADER_CAP_INTEGERS:
-      case PIPE_SHADER_CAP_MAX_SHADER_IMAGES:
-         return 0;
-
-      case PIPE_SHADER_CAP_MAX_TEXTURE_SAMPLERS:
-      case PIPE_SHADER_CAP_MAX_SAMPLER_VIEWS:
-         return 16;
-
-      case PIPE_SHADER_CAP_TGSI_SQRT_SUPPORTED:
-         return 1;
-
-      case PIPE_SHADER_CAP_DROUND_SUPPORTED:
-      case PIPE_SHADER_CAP_DFRACEXP_DLDEXP_SUPPORTED:
-         return 0;
-
-      case PIPE_SHADER_CAP_TGSI_ANY_INOUT_DECL_RANGE:
-         return 0;
-
-      case PIPE_SHADER_CAP_MAX_SHADER_BUFFERS:
-         return 0;
-
-      case PIPE_SHADER_CAP_SUPPORTED_IRS:
-         return 1 << PIPE_SHADER_IR_TGSI;
-
-      case PIPE_SHADER_CAP_PREFERRED_IR:
-         return PIPE_SHADER_IR_TGSI;
-
-      case PIPE_SHADER_CAP_LDEXP_SUPPORTED:
-          return 0;
-
-      case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTERS:
-      case PIPE_SHADER_CAP_MAX_HW_ATOMIC_COUNTER_BUFFERS:
-          return 0;
-
-      case PIPE_SHADER_CAP_FP16:
-      case PIPE_SHADER_CAP_FP16_CONST_BUFFERS:
-      case PIPE_SHADER_CAP_FP16_DERIVATIVES:
-      case PIPE_SHADER_CAP_INT16:
-      case PIPE_SHADER_CAP_INT64_ATOMICS:
-      case PIPE_SHADER_CAP_GLSL_16BIT_CONSTS:
-          return 0;
-
-      default:
-         fprintf(stdout, "%s: unsupported fragment-shader parameter: %d\n", __func__, param);
-         return 0;
-      }
-      break;
-
-   case PIPE_SHADER_GEOMETRY:
-   case PIPE_SHADER_TESS_CTRL:
-   case PIPE_SHADER_TESS_EVAL:
-   case PIPE_SHADER_COMPUTE:
-      return 0;
-
-   default:
-      fprintf(stdout, "%s: unknown shader type: %u\n", __func__, shader);
-      return 0;
-   }
+   /* no control flow, no indirection */
+   caps->max_instructions =
+   caps->max_alu_instructions = 4 * 128;
+   caps->max_tex_instructions =
+   caps->max_tex_indirections = 128;
+   caps->max_inputs =
+   caps->max_outputs = 16;
+   caps->max_const_buffer0_size = 32;
+   caps->max_const_buffers = 1;
+   caps->max_temps = 16; /* scalars */
+   caps->max_texture_samplers =
+   caps->max_sampler_views = 16;
+   caps->tgsi_sqrt_supported = true;
+   caps->supported_irs = (1 << PIPE_SHADER_IR_NIR) | (1 << PIPE_SHADER_IR_TGSI);
 }
+
+/* What the state tracker lowers before grate turns NIR into TGSI. */
+static const nir_shader_compiler_options grate_nir_options = {
+   .fuse_ffma32 = true,
+   .lower_bitops = true,
+   .lower_extract_byte = true,
+   .lower_extract_word = true,
+   .lower_fdiv = true,
+   .lower_fsat = true,
+   .lower_insert_byte = true,
+   .lower_insert_word = true,
+   .lower_fdph = true,
+   .lower_flrp32 = true,
+   .lower_fmod = true,
+   .lower_fpow = true,
+   .lower_uniforms_to_ubo = true,
+   .force_indirect_unrolling = nir_var_all,
+   .force_indirect_unrolling_sampler = true,
+   .max_unroll_iterations = 32,
+   .no_integers = true,
+};
 
 
 static bool
@@ -691,9 +317,6 @@ grate_screen_create(int fd)
    screen->base.get_name = grate_screen_get_name;
    screen->base.get_vendor = grate_screen_get_vendor;
    screen->base.get_device_vendor = grate_screen_get_device_vendor;
-   screen->base.get_param = grate_screen_get_param;
-   screen->base.get_paramf = grate_screen_get_paramf;
-   screen->base.get_shader_param = grate_screen_get_shader_param;
    screen->base.context_create = grate_screen_context_create;
    screen->base.is_format_supported = grate_screen_is_format_supported;
    screen->base.query_dmabuf_modifiers = grate_screen_query_dmabuf_modifiers;
@@ -702,6 +325,12 @@ grate_screen_create(int fd)
    /* fence functions */
    screen->base.fence_reference = grate_screen_fence_reference;
    screen->base.fence_finish = grate_screen_fence_finish;
+
+   for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
+      screen->base.nir_options[i] = &grate_nir_options;
+
+   grate_init_screen_caps(&screen->base);
+   grate_init_shader_caps(&screen->base);
 
    grate_screen_resource_init(&screen->base);
 

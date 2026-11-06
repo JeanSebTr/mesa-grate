@@ -48,13 +48,13 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
       err = drm_tegra_bo_get_name(resource->bo, &handle->handle);
       if (err < 0) {
          fprintf(stderr, "drm_tegra_bo_get_name() failed: %d\n", err);
-         return FALSE;
+         return false;
       }
    } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
       err = drm_tegra_bo_get_handle(resource->bo, &handle->handle);
       if (err < 0) {
          fprintf(stderr, "drm_tegra_bo_get_handle() failed: %d\n", err);
-         return FALSE;
+         return false;
       }
    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
       /*
@@ -67,17 +67,17 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
       err = drm_tegra_bo_to_dmabuf(resource->bo, &handle->handle);
       if (err < 0) {
          fprintf(stderr, "drm_tegra_bo_to_dmabuf() failed: %d\n", err);
-         return FALSE;
+         return false;
       }
       handle->modifier = DRM_FORMAT_MOD_LINEAR;
    } else {
       fprintf(stdout, "unsupported handle type: %d\n", handle->type);
-      return FALSE;
+      return false;
    }
 
    handle->stride = resource->pitch;
    handle->offset = 0;
-   return TRUE;
+   return true;
 }
 
 static void
@@ -443,7 +443,7 @@ fill(struct grate_channel *gr2d,
       value |= 2 << 16;
       break;
    default:
-      unreachable("invalid blocksize");
+      UNREACHABLE("invalid blocksize");
    }
    grate_stream_push(&gr2d->stream, value);           /* 0x01f - controlmain */
 
@@ -472,6 +472,7 @@ fill(struct grate_channel *gr2d,
 
 static void
 grate_clear(struct pipe_context *pcontext, unsigned int buffers,
+            uint32_t color_clear_mask, uint8_t stencil_clear_mask,
             const struct pipe_scissor_state *scissor_state,
             const union pipe_color_union *color, double depth,
             unsigned int stencil)
@@ -484,8 +485,12 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
    if (buffers & PIPE_CLEAR_COLOR) {
       int i;
       for (i = 0; i < fb->nr_cbufs; ++i) {
-         struct pipe_surface *dst = fb->cbufs[i];
-         unsigned x0 = 0, y0 = 0, x1 = dst->width, y1 = dst->height;
+         struct pipe_surface *dst = &fb->cbufs[i];
+         unsigned x0 = 0, y0 = 0, x1, y1;
+
+         if (!dst->texture)
+            continue;
+         pipe_surface_size(dst, &x1, &y1);
 
          /* scissored clear: clients often clear only a damaged area */
          if (scissor_state) {
@@ -506,12 +511,14 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
    }
 
    if (buffers & PIPE_CLEAR_DEPTH || buffers & PIPE_CLEAR_STENCIL) {
-      if (fb->zsbuf && !grate_resource(fb->zsbuf->texture)->no_hw_zs) {
+      if (fb->zsbuf.texture && !grate_resource(fb->zsbuf.texture)->no_hw_zs) {
          /* TODO: handle the case where both are not set! */
-         if (fill(context->gr2d, grate_resource(fb->zsbuf->texture),
-                  util_pack_z_stencil(fb->zsbuf->format, depth, stencil),
-                  util_format_get_blocksize(fb->zsbuf->format),
-                  0, 0, fb->zsbuf->width, fb->zsbuf->height) < 0)
+         unsigned w, h;
+         pipe_surface_size(&fb->zsbuf, &w, &h);
+         if (fill(context->gr2d, grate_resource(fb->zsbuf.texture),
+                  util_pack_z_stencil(fb->zsbuf.format, depth, stencil),
+                  util_format_get_blocksize(fb->zsbuf.format),
+                  0, 0, w, h) < 0)
             return;
       }
    }
@@ -569,6 +576,7 @@ grate_context_resource_init(struct pipe_context *pcontext)
    pcontext->blit = grate_blit;
    pcontext->clear = grate_clear;
    pcontext->flush_resource = grate_flush_resource;
+   pcontext->resource_release = u_default_resource_release;
    pcontext->clear_render_target = grate_clear_render_target;
    pcontext->clear_depth_stencil = grate_clear_depth_stencil;
 }

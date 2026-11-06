@@ -26,13 +26,18 @@
 #include "util/os_file.h"
 #include "util/u_debug.h"
 
+#ifdef GALLIUM_TEGRA
 #include "tegra/tegra_screen.h"
+#endif
+#ifdef GALLIUM_GRATE
+#include "grate/grate_screen.h"
+#endif
 
 struct pipe_screen *tegra_drm_screen_create(int fd);
 
 struct pipe_screen *tegra_drm_screen_create(int fd)
 {
-   struct pipe_screen *screen;
+   struct pipe_screen *screen = NULL;
 
    /*
     * NOTE: There are reportedly issues with reusing the file descriptor
@@ -42,7 +47,13 @@ struct pipe_screen *tegra_drm_screen_create(int fd)
    if (fd < 0)
       return NULL;
 
+#ifdef GALLIUM_TEGRA
    screen = tegra_screen_create(fd);
+#endif
+#ifdef GALLIUM_GRATE
+   if (!screen)
+      screen = grate_screen_create(fd);
+#endif
    if (!screen)
       close(fd);
 

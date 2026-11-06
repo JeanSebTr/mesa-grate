@@ -55,8 +55,6 @@ files_libgrate = files(
   'grate_state.h',
   'grate_stream.c',
   'grate_stream.h',
-  'grate_surface.c',
-  'grate_surface.h',
 )
 
 inc_libgrate = include_directories('drm')
@@ -69,7 +67,7 @@ libgrate = static_library(
     inc_gallium_drivers, inc_libgrate,
   ],
   gnu_symbol_visibility : 'hidden',
-  dependencies : [dep_libdrm, idep_mesautil],
+  dependencies : [dep_libdrm, idep_mesautil, idep_nir_headers],
   build_by_default : false,
 )
 

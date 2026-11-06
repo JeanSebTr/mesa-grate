@@ -28,6 +28,7 @@ struct grate_vertex_element {
    uint32_t attrib;
    unsigned int buffer_index;
    unsigned int offset;
+   unsigned int stride;
 };
 
 struct grate_vertex_state {

@@ -13,7 +13,6 @@
 #include "grate_resource.h"
 #include "grate_screen.h"
 #include "grate_state.h"
-#include "grate_surface.h"
 
 #include "host1x01_hardware.h"
 #include "tgr_3d.xml.h"
@@ -116,7 +115,7 @@ grate_screen_context_create(struct pipe_screen *pscreen,
    context->base.priv = priv;
 
    context->primconvert = util_primconvert_create(&context->base,
-                                                  (1 << PIPE_PRIM_QUADS) - 1);
+                                                  (1 << MESA_PRIM_QUADS) - 1);
 
    err = grate_channel_create(context, DRM_TEGRA_GR2D, &context->gr2d);
    if (err < 0) {
@@ -138,7 +137,6 @@ grate_screen_context_create(struct pipe_screen *pscreen,
    context->base.const_uploader = context->base.stream_uploader;
 
    grate_context_resource_init(&context->base);
-   grate_context_surface_init(&context->base);
    grate_context_state_init(&context->base);
    grate_context_blend_init(&context->base);
    grate_context_sampler_init(&context->base);

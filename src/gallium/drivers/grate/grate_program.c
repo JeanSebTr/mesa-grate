@@ -4,6 +4,7 @@
 #include "util/u_dynarray.h"
 #include "util/u_memory.h"
 
+#include "nir/nir_to_tgsi.h"
 #include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_parse.h"
 #include "tgsi/tgsi_scan.h"
@@ -79,6 +80,18 @@ grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
 }
 
 
+/* Mesa hands drivers NIR; grate still compiles TGSI. */
+static const struct tgsi_token *
+grate_shader_tokens(struct pipe_context *pcontext,
+                    const struct pipe_shader_state *template)
+{
+   if (template->type == PIPE_SHADER_IR_NIR)
+      return nir_to_tgsi(template->ir.nir, pcontext->screen);
+
+   assert(template->type == PIPE_SHADER_IR_TGSI);
+   return tgsi_dup_tokens(template->tokens);
+}
+
 static void *
 grate_create_vs_state(struct pipe_context *pcontext,
                       const struct pipe_shader_state *template)
@@ -89,17 +102,24 @@ grate_create_vs_state(struct pipe_context *pcontext,
    if (!so)
       return NULL;
 
-   so->base = *template;
+   const struct tgsi_token *tokens = grate_shader_tokens(pcontext, template);
+   if (!tokens) {
+      FREE(so);
+      return NULL;
+   }
 
    if (grate_debug & GRATE_DEBUG_TGSI) {
       fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(template->tokens, 0);
+      tgsi_dump(tokens, 0);
       fprintf(stderr, "\n");
    }
 
-   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(template->tokens);
-   if (!new_tokens)
+   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(tokens);
+   FREE((void *)tokens);
+   if (!new_tokens) {
+      FREE(so);
       return NULL;
+   }
 
    struct tgsi_parse_context parser;
    unsigned ok = tgsi_parse_init(&parser, new_tokens);
@@ -168,7 +188,7 @@ grate_fs_compile(struct grate_context *context, const struct tgsi_token *tokens,
    struct util_dynarray buf;
    util_dynarray_init(&buf, NULL);
 
-#define PUSH(x) util_dynarray_append(&buf, uint32_t, (x))
+#define PUSH(x) util_dynarray_append_typed(&buf, uint32_t, (x))
    PUSH(host1x_opcode_incr(TGR3D_ALU_BUFFER_SIZE, 1));
    /* SIZEx4 = (pseq cfg 0x12c - 1) / (size * 4), matches 0x501 */
    PUSH(TGR3D_VAL(ALU_BUFFER_SIZE, SIZE, fp.alu_buf_size - 1) |
@@ -282,12 +302,16 @@ grate_create_fs_state(struct pipe_context *pcontext,
    if (!so)
       return NULL;
 
-   so->base = *template;
-   so->base.tokens = tgsi_dup_tokens(template->tokens);
+   so->base.type = PIPE_SHADER_IR_TGSI;
+   so->base.tokens = grate_shader_tokens(pcontext, template);
+   if (!so->base.tokens) {
+      FREE(so);
+      return NULL;
+   }
 
    if (grate_debug & GRATE_DEBUG_TGSI) {
       fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(template->tokens, 0);
+      tgsi_dump(so->base.tokens, 0);
       fprintf(stderr, "\n");
    }
 

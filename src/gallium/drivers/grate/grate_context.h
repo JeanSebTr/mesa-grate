@@ -43,7 +43,7 @@ struct grate_context {
 
    struct grate_vertex_state *vs;
    struct grate_vertexbuf_state vbs;
-   struct pipe_constant_buffer constant_buffer[PIPE_SHADER_TYPES];
+   struct pipe_constant_buffer constant_buffer[MESA_SHADER_STAGES];
 
    struct grate_zsa_state *zsa;
    struct grate_rasterizer_state *rast;
