@@ -22,6 +22,8 @@ static const struct debug_named_value debug_options[] = {
      "Print unimplemented functions" },
    { "tgsi", GRATE_DEBUG_TGSI,
      "Dump TGSI during program compile" },
+   { "fs", GRATE_DEBUG_FS,
+     "Print fragment shaders as NIR (all of them, or with the failure for unsupported ones)" },
    { NULL }
 };
 
@@ -119,6 +121,10 @@ grate_init_screen_caps(struct pipe_screen *pscreen)
    caps->mixed_colorbuffer_formats = true;
    caps->allow_mapped_buffers_during_execution = false;
    caps->max_varyings = 16;
+   /* gl_FragCoord from the position registers, see fp/nir.c */
+   caps->fs_position_is_sysval = true;
+   caps->fs_coord_origin_upper_left = true;
+   caps->fs_coord_pixel_center_half_integer = true;
    /* resource_get_handle/from_handle do both (EGL and GBM) */
    caps->dmabuf = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT;
 
@@ -165,7 +171,8 @@ grate_init_shader_caps(struct pipe_screen *pscreen)
    caps->max_tex_indirections = 128;
    caps->max_inputs =
    caps->max_outputs = 16;
-   caps->max_const_buffer0_size = 32;
+   /* 32 uniform registers, but the compiler only uploads what it uses */
+   caps->max_const_buffer0_size = 64 * 4 * sizeof(float);
    caps->max_const_buffers = 1;
    caps->max_temps = 16; /* scalars */
    caps->max_texture_samplers =

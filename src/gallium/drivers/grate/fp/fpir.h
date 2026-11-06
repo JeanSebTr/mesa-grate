@@ -137,6 +137,9 @@ struct fp_mfu_instr {
 struct fp_alu_instr_packet {
    struct list_head link;
    struct fp_alu_instr slots[4];
+   /* slot 3 replaced by three fp20 constants, read as registers 28-30 */
+   bool has_imm;
+   uint32_t imm[3];
 };
 
 struct fp_tex_instr {

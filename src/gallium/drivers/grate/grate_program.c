@@ -5,6 +5,9 @@
 #include "util/u_memory.h"
 
 #include "nir/nir_to_tgsi.h"
+#include "nir/tgsi_to_nir.h"
+#include "compiler/nir/nir.h"
+#include "util/u_debug.h"
 #include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_parse.h"
 #include "tgsi/tgsi_scan.h"
@@ -172,17 +175,21 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
    FREE(so);
 }
 
-static void
-grate_fs_compile(struct grate_context *context, const struct tgsi_token *tokens,
+static bool
+grate_fs_compile(struct grate_context *context,
+                 struct grate_fragment_shader_state *fs,
                  enum grate_blend_mode mode, struct grate_shader_blob *blob,
                  struct grate_fp_info *info)
 {
-   struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, tokens);
-   assert(ok == TGSI_PARSE_OK);
-
    struct grate_fp_shader fp;
-   grate_tgsi_to_fp(&fp, &parser);
+
+   const char *error = NULL;
+   if (!grate_nir_to_fp(&fp, fs->nir, &error)) {
+      /* drawn as nothing, see fp/nir.c */
+      fprintf(stderr, "grate: fragment shader not supported: %s\n", error);
+      if (grate_debug & GRATE_DEBUG_FS)
+         nir_print_shader(fs->nir, stderr);
+   }
    grate_fp_append_blend(&fp, mode);
 
    struct util_dynarray buf;
@@ -262,6 +269,15 @@ grate_fs_compile(struct grate_context *context, const struct tgsi_token *tokens,
    list_for_each_entry(struct fp_alu_instr_packet, instr, &fp.alu_instructions, link) {
       for (int i = 0; i < 4; ++i) {
          uint32_t words[2];
+         if (i == 3 && instr->has_imm) {
+            /* not swapped, unlike instructions */
+            uint64_t v = (uint64_t)instr->imm[0] << 4 |
+                         (uint64_t)instr->imm[1] << 24 |
+                         (uint64_t)instr->imm[2] << 44;
+            PUSH((uint32_t)v);
+            PUSH((uint32_t)(v >> 32));
+            continue;
+         }
          grate_fp_pack_alu(words, instr->slots + i);
          PUSH(words[0]);
          PUSH(words[1]);
@@ -288,7 +304,11 @@ grate_fs_compile(struct grate_context *context, const struct tgsi_token *tokens,
 
    blob->num_commands = buf.size / sizeof(uint32_t);
    blob->commands = buf.data;
+   if (getenv("GRATE_FP_DUMP"))
+      for (int i = 0; i < blob->num_commands; i++)
+         fprintf(stderr, "DUMP %08x\n", blob->commands[i]);
    *info = fp.info;
+   return true;
 }
 
 static void *
@@ -302,21 +322,19 @@ grate_create_fs_state(struct pipe_context *pcontext,
    if (!so)
       return NULL;
 
-   so->base.type = PIPE_SHADER_IR_TGSI;
-   so->base.tokens = grate_shader_tokens(pcontext, template);
-   if (!so->base.tokens) {
+   /* Mesa's own utility shaders can still come as TGSI */
+   so->nir = template->type == PIPE_SHADER_IR_NIR ? template->ir.nir :
+             tgsi_to_nir(template->tokens, pcontext->screen, false);
+   grate_nir_fs_lower(so->nir);
+   if (grate_debug & GRATE_DEBUG_FS)
+      nir_print_shader(so->nir, stderr);
+
+   if (!grate_fs_compile(context, so, GRATE_BLEND_NONE,
+                         &so->variants[GRATE_BLEND_NONE], &so->info)) {
+      ralloc_free(so->nir);
       FREE(so);
       return NULL;
    }
-
-   if (grate_debug & GRATE_DEBUG_TGSI) {
-      fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(so->base.tokens, 0);
-      fprintf(stderr, "\n");
-   }
-
-   grate_fs_compile(context, so->base.tokens, GRATE_BLEND_NONE,
-                    &so->variants[GRATE_BLEND_NONE], &so->info);
    return so;
 }
 
@@ -361,7 +379,7 @@ grate_fs_variant(struct grate_context *context)
 
    if (!fs->variants[mode].commands) {
       struct grate_fp_info info;
-      grate_fs_compile(context, fs->base.tokens, mode, &fs->variants[mode], &info);
+      grate_fs_compile(context, fs, mode, &fs->variants[mode], &info);
    }
 
    return &fs->variants[mode];
@@ -380,7 +398,7 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
 
    for (int i = 0; i < GRATE_BLEND_COUNT; i++)
       FREE(fs->variants[i].commands);
-   FREE((void *)fs->base.tokens);
+   ralloc_free(fs->nir);
    FREE(so);
 }
 

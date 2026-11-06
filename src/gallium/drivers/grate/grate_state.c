@@ -711,6 +711,77 @@ emit_vs_uniforms(struct grate_context *context)
    }
 }
 
+static uint32_t
+float_to_fp20(float f)
+{
+   uint32_t u = fui(f);
+   if (f == 0.0f)
+      return 0;
+   uint32_t sign = u >> 31, exponent = (u >> 23) & 0xff;
+   int e = (int)exponent - 127 + 31;
+   if (exponent == 0xff || e > 0x3f)
+      e = 0x3f;
+   if (e <= 0)
+      return sign << 19;
+   return sign << 19 | (uint32_t)e << 13 | (u & 0x7fffff) >> 10;
+}
+
+/* the uniform registers a NIR-compiled fragment program reads, see fp/nir.c */
+static void
+emit_fs_uniforms(struct grate_context *context, const struct grate_fp_info *info)
+{
+   struct grate_stream *stream = &context->gr3d->stream;
+   const struct pipe_constant_buffer *cb =
+      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+   const float *data = cb->user_buffer;
+   uint32_t regs[GRATE_FP_MAX_UNIFORMS];
+
+   if (!info->num_uniforms)
+      return;
+
+   for (int i = 0; i < info->num_uniforms; i++) {
+      uint32_t u = info->uniforms[i];
+      uint32_t payload = GRATE_FP_UNIFORM_PAYLOAD(u);
+      float f = 0.0f;
+      switch (GRATE_FP_UNIFORM_KIND(u)) {
+      case GRATE_FP_UNIFORM_KIND_CB:
+         if (data && payload * 4 < cb->buffer_size)
+            f = data[payload];
+         break;
+      case GRATE_FP_UNIFORM_KIND_IMM:
+         f = uif(payload << 4);
+         break;
+      case GRATE_FP_UNIFORM_KIND_FB_Y:
+         /*
+          * pos.y counts render target rows when the viewport isn't flipped
+          * (FBOs), and from the bottom when it is.
+          */
+         if (context->y_invert)
+            f = payload ? 8191.0f + context->framebuffer.base.height : -1.0f;
+         else
+            f = payload ? -8192.0f : 1.0f;
+         break;
+      case GRATE_FP_UNIFORM_KIND_CB_PAIR: {
+         /* two fx10 (1/256 steps, [-4, 4)) in the low and high halves */
+         uint32_t lohi = 0;
+         for (int h = 0; h < 2; h++) {
+            uint32_t dw = (payload >> (14 * h)) & 0x3fff;
+            float v = data && dw * 4 < cb->buffer_size ? data[dw] : 0.0f;
+            int x = (int)lrintf(CLAMP(v, -4.0f, 1023.0f / 256.0f) * 256.0f);
+            lohi |= (uint32_t)(x & 0x3ff) << (10 * h);
+         }
+         regs[i] = lohi;
+         continue;
+      }
+      }
+      regs[i] = float_to_fp20(f);
+   }
+
+   grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_CONST(0),
+                                                info->num_uniforms));
+   grate_stream_push_words(stream, regs, info->num_uniforms, 0);
+}
+
 static void
 emit_shader(struct grate_stream *stream, const struct grate_shader_blob *blob)
 {
@@ -724,6 +795,7 @@ emit_program(struct grate_context *context)
 
    emit_shader(stream, &context->vshader->blob);
    emit_shader(stream, grate_fs_variant(context));
+   emit_fs_uniforms(context, &context->fshader->info);
 
    uint32_t cull_face_linker_setup = TGR3D_VAL(CULL_FACE_LINKER_SETUP,
                                                UNK_18_31, 0x2e38);

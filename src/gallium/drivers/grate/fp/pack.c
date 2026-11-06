@@ -54,6 +54,8 @@ grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr)
       .opcode = instr->op,
       .dst_reg = instr->dst.index,
       .saturate_result = instr->dst.saturate,
+      .condition_code = instr->condition,
+      .scale_result = instr->scale,
 
       .write_low_sub_reg = instr->dst.write_low_sub_reg,
       .write_high_sub_reg = instr->dst.write_high_sub_reg,
@@ -83,9 +85,8 @@ grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr)
       .rC_fixed10 = instr->src[2].datatype != FP_DATATYPE_FP20,
       .rC_sub_reg_select_high = instr->src[2].sub_reg_select_high,
 
-      .rD_reg_select = instr->src[3].index == instr->src[2].index,
-      .rD_fixed10 = instr->src[3].datatype != FP_DATATYPE_FP20,
-      .rD_sub_reg_select_high = instr->src[3].sub_reg_select_high,
+      /* rD is never enabled: leave its fields clear, as the assembler does;
+       * stray rD bits change results inside multi-slot packets */
    };
 
    /* Tegra114 uses these bits for extra opcodes when rD is disabled */

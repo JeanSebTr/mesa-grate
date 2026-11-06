@@ -24,6 +24,7 @@ struct grate_fragment_shader_state {
    struct pipe_shader_state base;
    struct grate_shader_blob variants[GRATE_BLEND_COUNT];
    struct grate_fp_info info;
+   struct nir_shader *nir; /* NIR compiler path, else base.tokens */
 };
 
 struct grate_context;
