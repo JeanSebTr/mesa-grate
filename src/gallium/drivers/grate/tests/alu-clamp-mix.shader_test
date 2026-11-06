@@ -1,0 +1,26 @@
+# clamp, saturate and mix
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying vec2 v;
+void main()
+{
+	gl_Position = piglit_vertex;
+	v = piglit_vertex.xy * 0.5 + 0.5;
+}
+
+[fragment shader]
+#version 100
+precision mediump float;
+varying vec2 v;
+void main() { gl_FragColor = vec4(clamp(v.x * 2.0 - 0.5, 0.0, 1.0), mix(0.25, 0.75, v.y), 0.0, 1.0); }
+
+[test]
+draw rect -1 -1 2 2
+relative probe rgba (0.125, 0.5) (0.0, 0.5, 0.0, 1.0)
+relative probe rgba (0.875, 0.5) (1.0, 0.5, 0.0, 1.0)
+relative probe rgba (0.5, 0.5) (0.5, 0.5, 0.0, 1.0)

@@ -1,0 +1,50 @@
+# uniform array, blur-kernel sized (16 weights)
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying vec2 v;
+void main()
+{
+	gl_Position = piglit_vertex;
+	v = piglit_vertex.xy * 0.5 + 0.5;
+}
+
+[fragment shader]
+#version 100
+precision mediump float;
+varying vec2 v;
+uniform sampler2D tex;
+uniform float w[16];
+void main() {
+	vec4 s = vec4(0.0);
+	for (int i = 0; i < 16; i++)
+		s += texture2D(tex, v + vec2(float(i - 8) / 256.0, 0.0)) * w[i];
+	gl_FragColor = s;
+}
+
+[test]
+texture rgbw 0 (8, 8)
+uniform int tex 0
+uniform float w[0] 0.0625
+uniform float w[1] 0.0625
+uniform float w[2] 0.0625
+uniform float w[3] 0.0625
+uniform float w[4] 0.0625
+uniform float w[5] 0.0625
+uniform float w[6] 0.0625
+uniform float w[7] 0.0625
+uniform float w[8] 0.0625
+uniform float w[9] 0.0625
+uniform float w[10] 0.0625
+uniform float w[11] 0.0625
+uniform float w[12] 0.0625
+uniform float w[13] 0.0625
+uniform float w[14] 0.0625
+uniform float w[15] 0.0625
+draw rect -1 -1 2 2
+relative probe rgba (0.125, 0.25) (1.0, 0.0, 0.0, 1.0)
+relative probe rgba (0.875, 0.75) (1.0, 1.0, 1.0, 1.0)

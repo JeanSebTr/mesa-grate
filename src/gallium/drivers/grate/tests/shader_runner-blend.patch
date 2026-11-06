@@ -1,0 +1,47 @@
+diff --git a/tests/shaders/shader_runner.c b/tests/shaders/shader_runner.c
+index b379558..9997a4e 100644
+--- a/tests/shaders/shader_runner.c
++++ b/tests/shaders/shader_runner.c
+@@ -4595,12 +4595,33 @@ static const struct string_to_enum enable_table[] = {
+ 	{ "GL_VERTEX_PROGRAM_TWO_SIDE", GL_VERTEX_PROGRAM_TWO_SIDE },
+ 	{ "GL_PROGRAM_POINT_SIZE", GL_PROGRAM_POINT_SIZE },
+ 	{ "GL_DEPTH_TEST", GL_DEPTH_TEST },
++	{ "GL_BLEND", GL_BLEND },
+ 	{ "GL_DEPTH_CLAMP", GL_DEPTH_CLAMP },
+ 	{ "GL_SAMPLE_ALPHA_TO_ONE", GL_SAMPLE_ALPHA_TO_ONE },
+ 	{ "GL_SAMPLE_ALPHA_TO_COVERAGE", GL_SAMPLE_ALPHA_TO_COVERAGE },
+ 	{ NULL, 0 }
+ };
+ 
++static const struct string_to_enum blend_factor_table[] = {
++	{ "GL_ZERO", GL_ZERO },
++	{ "GL_ONE", GL_ONE },
++	{ "GL_SRC_ALPHA", GL_SRC_ALPHA },
++	{ "GL_ONE_MINUS_SRC_ALPHA", GL_ONE_MINUS_SRC_ALPHA },
++	{ "GL_DST_ALPHA", GL_DST_ALPHA },
++	{ "GL_ONE_MINUS_DST_ALPHA", GL_ONE_MINUS_DST_ALPHA },
++	{ NULL, 0 }
++};
++
++static void
++do_blend_func(const char *line)
++{
++	GLenum src, dst;
++	REQUIRE(parse_enum_tab(blend_factor_table, line, &src, &line) &&
++		parse_enum_tab(blend_factor_table, line, &dst, NULL),
++		"Bad blend func at: %s\n", line);
++	glBlendFunc(src, dst);
++}
++
+ static void
+ do_enable_disable(const char *line, bool enable_flag)
+ {
+@@ -5961,6 +5982,8 @@ piglit_display(void)
+ 					   GL_FALSE, 0, GL_READ_WRITE, img_fmt);
+ 		} else if (sscanf(line, "memory barrier %s", s) == 1) {
+ 			glMemoryBarrier(piglit_get_gl_memory_barrier_enum_from_name(s));
++		} else if (parse_str(line, "blend func ", &rest)) {
++			do_blend_func(rest);
+ 		} else if (parse_str(line, "blend barrier", NULL)) {
+ 			glBlendBarrier();
+ 		} else if (parse_str(line, "fbfetch barrier", NULL)) {

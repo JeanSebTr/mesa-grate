@@ -1,0 +1,25 @@
+# abs and negate modifiers
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying vec2 v;
+void main()
+{
+	gl_Position = piglit_vertex;
+	v = piglit_vertex.xy * 0.5 + 0.5;
+}
+
+[fragment shader]
+#version 100
+precision mediump float;
+varying vec2 v;
+void main() { float d = v.x - 0.5; gl_FragColor = vec4(abs(d) * 2.0, -d + 0.5, 0.0, 1.0); }
+
+[test]
+draw rect -1 -1 2 2
+relative probe rgba (0.25, 0.5) (0.5, 0.75, 0.0, 1.0)
+relative probe rgba (0.75, 0.5) (0.5, 0.25, 0.0, 1.0)

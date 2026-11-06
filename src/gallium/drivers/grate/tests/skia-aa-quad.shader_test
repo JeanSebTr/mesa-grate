@@ -1,0 +1,60 @@
+# Skia (GL backend) antialiased textured quad fragment shader
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying highp vec2 vlocalCoord_S0;
+varying highp vec2 vTransformedCoords_2_S0;
+varying mediump vec4 vcolor_S0;
+varying highp float vcoverage_S0;
+varying highp vec4 vgeomSubset_S0;
+void main()
+{
+	gl_Position = piglit_vertex;
+	vlocalCoord_S0 = piglit_vertex.xy * 0.5 + 0.5;
+	vTransformedCoords_2_S0 = vlocalCoord_S0;
+	vcolor_S0 = vec4(1.0);
+	vcoverage_S0 = 1.0;
+	vgeomSubset_S0 = vec4(20.0, 20.0, 230.0, 230.0);
+}
+
+[fragment shader]
+#version 100
+
+uniform highp vec2 u_skRTFlip;
+precision mediump float;
+precision mediump sampler2D;
+uniform sampler2D uTextureSampler_0_S0;
+varying highp vec2 vlocalCoord_S0;
+varying highp float vcoverage_S0;
+varying highp vec4 vgeomSubset_S0;
+void main() {
+highp     vec4 sk_FragCoord = vec4(gl_FragCoord.x, u_skRTFlip.x + u_skRTFlip.y * gl_FragCoord.y, gl_FragCoord.z, gl_FragCoord.w);
+mediump vec4 outputColor_S0 = vec4(1.0);
+highp vec2 texCoord = vlocalCoord_S0;
+outputColor_S0 = texture2D(uTextureSampler_0_S0, texCoord);
+highp float coverage = vcoverage_S0 * sk_FragCoord.w;
+highp vec4 geoSubset = vgeomSubset_S0;
+highp vec4 dists4 = clamp(vec4(1.0, 1.0, -1.0, -1.0) * (sk_FragCoord.xyxy - geoSubset), 0.0, 1.0);
+highp vec2 dists2 = (dists4.xy + dists4.zw) - 1.0;
+coverage = min(coverage, dists2.x * dists2.y);
+mediump vec4 outputCoverage_S0 = vec4(coverage);
+{
+gl_FragColor = outputColor_S0 * outputCoverage_S0;
+}
+}
+
+
+[test]
+texture rgbw 0 (8, 8)
+uniform int uTextureSampler_0_S0 0
+uniform vec2 u_skRTFlip 0.0 1.0
+draw rect -1 -1 2 2
+probe rgba 10 10 0.0 0.0 0.0 0.0
+probe rgba 240 125 0.0 0.0 0.0 0.0
+probe rgba 62 62 1.0 0.0 0.0 1.0
+probe rgba 187 62 0.0 1.0 0.0 1.0
+probe rgba 62 187 0.0 0.0 1.0 1.0

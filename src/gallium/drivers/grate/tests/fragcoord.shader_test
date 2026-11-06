@@ -1,0 +1,25 @@
+# gl_FragCoord position and origin (bottom-left, pixel centres)
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying vec2 v;
+void main()
+{
+	gl_Position = piglit_vertex;
+	v = piglit_vertex.xy * 0.5 + 0.5;
+}
+
+[fragment shader]
+#version 100
+precision mediump float;
+varying vec2 v;
+void main() { gl_FragColor = vec4(gl_FragCoord.xy / 250.0, 0.0, 1.0); }
+
+[test]
+draw rect -1 -1 2 2
+probe rgba 25 200 0.102 0.802 0.0 1.0
+probe rgba 200 25 0.802 0.102 0.0 1.0
