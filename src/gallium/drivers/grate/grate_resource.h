@@ -10,6 +10,8 @@ struct grate_resource {
    unsigned int pitch;
    unsigned int tiled : 1;
    unsigned int format : 5;
+   /* depth/stencil format GR3D can't render to: allocated, never bound */
+   unsigned int no_hw_zs : 1;
 };
 
 static inline struct grate_resource *

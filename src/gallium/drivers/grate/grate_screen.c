@@ -56,6 +56,9 @@ static int
 grate_screen_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 {
    switch (param) {
+   case PIPE_CAP_CLEAR_SCISSORED:
+      return 1;
+
    case PIPE_CAP_NPOT_TEXTURES:
       return 1; /* not really, but mesa requires it for now! */
 
@@ -575,7 +578,18 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                  unsigned storage_sample_count,
                                  unsigned usage)
 {
-   if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) {
+   /*
+    * Combined depth/stencil isn't a GR3D format, but some EGL clients
+    * insist on a stencil-8 config. Expose it; the buffer is never bound,
+    * so depth and stencil tests are no-ops.
+    */
+   if ((usage & PIPE_BIND_DEPTH_STENCIL) &&
+       (format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+        format == PIPE_FORMAT_S8_UINT_Z24_UNORM))
+      return true;
+
+   if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
+                PIPE_BIND_SAMPLER_VIEW)) {
       if (grate_pixel_format(format) < 0)
          return false;
    }
@@ -588,7 +602,8 @@ grate_screen_fence_reference(struct pipe_screen *pscreen,
                              struct pipe_fence_handle **ptr,
                              struct pipe_fence_handle *fence)
 {
-   unimplemented();
+   /* fences are a static dummy, see grate_context_flush() */
+   *ptr = fence;
 }
 
 static bool
@@ -597,8 +612,7 @@ grate_screen_fence_finish(struct pipe_screen *screen,
                           struct pipe_fence_handle *fence,
                           uint64_t timeout)
 {
-   unimplemented();
-   return FALSE;
+   return true;
 }
 
 static const uint64_t grate_available_modifiers[] = {

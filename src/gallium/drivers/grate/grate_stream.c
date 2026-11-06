@@ -36,6 +36,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
+
+#include "util/macros.h"
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -130,10 +132,29 @@ grate_stream_flush(struct grate_stream *stream)
 cleanup:
    drm_tegra_job_free(stream->job);
 
+   for (unsigned i = 0; i < stream->num_bos; i++)
+      drm_tegra_bo_unref(stream->bos[i]);
+   stream->num_bos = 0;
+   stream->num_draws = 0;
+
    stream->job = NULL;
    stream->status = GRATE_STREAM_FREE;
 
    return result;
+}
+
+/*
+ * Append to the pending (ended, not yet submitted) job, or start a new one.
+ */
+int
+grate_stream_continue(struct grate_stream *stream)
+{
+   if (stream && stream->status == GRATE_STREAM_READY) {
+      stream->status = GRATE_STREAM_CONSTRUCT;
+      return 0;
+   }
+
+   return grate_stream_begin(stream);
 }
 
 /*
@@ -212,6 +233,13 @@ grate_stream_push_reloc(struct grate_stream *stream,
 
    ret = drm_tegra_pushbuf_relocate(stream->buffer.pushbuf,
                                     bo, offset, 0);
+   if (ret == 0) {
+      if (stream->num_bos == stream->max_bos) {
+         stream->max_bos = MAX2(16, stream->max_bos * 2);
+         stream->bos = realloc(stream->bos, stream->max_bos * sizeof(*stream->bos));
+      }
+      stream->bos[stream->num_bos++] = drm_tegra_bo_ref(bo);
+   }
    if (ret != 0) {
       stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
       ErrorMsg("drm_tegra_pushbuf_relocate() failed %d\n", ret);

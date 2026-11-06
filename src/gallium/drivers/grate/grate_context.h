@@ -24,6 +24,12 @@ struct grate_channel {
    struct grate_stream stream;
 };
 
+struct grate_context;
+
+/* submit the batched 3D draws and wait for them */
+void
+grate_flush_3d(struct grate_context *context);
+
 struct grate_context {
    struct pipe_context base;
    struct primconvert_context *primconvert;
@@ -43,9 +49,16 @@ struct grate_context {
    struct grate_rasterizer_state *rast;
 
    struct grate_vertex_shader_state *vshader;
+   struct pipe_blend_state *blend;
    struct grate_fragment_shader_state *fshader;
 
+   struct pipe_sampler_view *fragment_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
+   unsigned num_fragment_views;
+   struct pipe_sampler_state *fragment_samplers[PIPE_MAX_SAMPLERS];
+   unsigned num_fragment_samplers;
+
    uint32_t no_scissor[3];
+   struct pipe_scissor_state scissor;
    uint32_t viewport[10];
    uint32_t guardband[4];
    bool y_invert;

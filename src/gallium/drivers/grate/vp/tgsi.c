@@ -246,7 +246,7 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
 
    case TGSI_FILE_IMMEDIATE:
       /* HACK: allocate uniforms from the top for immediates; need to actually record these */
-      return uniform(1023 - src->Index, swizzle, negate, absolute);
+      return uniform(255 - src->Index, swizzle, negate, absolute);
 
    default:
       unreachable("unsupported input!");
@@ -321,6 +321,8 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
 {
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
+   memset(vp->output_semantic, 0, sizeof(vp->output_semantic));
+   vp->num_immediates = 0;
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
@@ -330,6 +332,22 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
             struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);
             list_addtail(&instr->link, &vp->instructions);
          }
+         break;
+
+      case TGSI_TOKEN_TYPE_DECLARATION: {
+         const struct tgsi_full_declaration *decl = &tgsi->FullToken.FullDeclaration;
+         if (decl->Declaration.File == TGSI_FILE_OUTPUT && decl->Declaration.Semantic)
+            for (unsigned r = decl->Range.First; r <= decl->Range.Last && r < 16; r++)
+               vp->output_semantic[r] = decl->Semantic.Name << 8 | decl->Semantic.Index;
+         break;
+      }
+
+      case TGSI_TOKEN_TYPE_IMMEDIATE:
+         assert(vp->num_immediates < ARRAY_SIZE(vp->immediates));
+         for (int i = 0; i < 4; i++)
+            vp->immediates[vp->num_immediates][i] =
+               tgsi->FullToken.FullImmediate.u[i].Uint;
+         vp->num_immediates++;
          break;
       }
    }

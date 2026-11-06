@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
 
@@ -225,7 +226,11 @@ grate_init_state(struct grate_context *context)
    if (context->tegra114)
       grate_stream_push(stream, host1x_opcode_imm(0x501, (0x2200 << 16) | 0x7));
    else
-      grate_stream_push(stream, host1x_opcode_imm(0x501, 0x7));
+   {
+      /* 32-bit value: doesn't fit in an IMM opcode */
+      grate_stream_push(stream, host1x_opcode_incr(0x501, 1));
+      grate_stream_push(stream, (0x2232 << 16) | (0x12c << 4) | 0xf);
+   }
 
    grate_stream_push(stream, host1x_opcode_imm(0x502, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x503, 0));
@@ -242,21 +247,21 @@ grate_init_state(struct grate_context *context)
    grate_stream_push(stream, host1x_opcode_imm(0x546, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x60e, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x702, 0));
-   grate_stream_push(stream, host1x_opcode_imm(0x740, 0x1));
+   grate_stream_push(stream, host1x_opcode_imm(0x740, 0x35));
    grate_stream_push(stream, host1x_opcode_imm(0x741, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x742, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x902, 0));
    grate_stream_push(stream, host1x_opcode_imm(0x903, 0));
 
    grate_stream_push(stream, host1x_opcode_incr(0xa00, 13));
-   grate_stream_push(stream, 0x00000e00); /* TGR3D_FDC_CONTROL */
+   grate_stream_push(stream, 0x00000e01); /* TGR3D_FDC_CONTROL */
    grate_stream_push(stream, 0x00000000);
    grate_stream_push(stream, 0x000001ff);
    grate_stream_push(stream, 0x000001ff);
    grate_stream_push(stream, 0x000001ff);
    grate_stream_push(stream, 0x00000030);
    grate_stream_push(stream, 0x00000020);
-   grate_stream_push(stream, 0x000001ff);
+   grate_stream_push(stream, 0x00000030);
    grate_stream_push(stream, 0x00000100);
    grate_stream_push(stream, 0x0f0f0f0f);
    grate_stream_push(stream, 0x00000000);
@@ -268,7 +273,7 @@ grate_init_state(struct grate_context *context)
    grate_stream_push(stream, host1x_opcode_imm(0xe22, 0));
    grate_stream_push(stream, host1x_opcode_imm(0xe25, 0));
    grate_stream_push(stream, host1x_opcode_imm(0xe26, 0));
-   grate_stream_push(stream, host1x_opcode_imm(0xe27, 0));
+   grate_stream_push(stream, host1x_opcode_imm(0xe27, 1));
    grate_stream_push(stream, host1x_opcode_imm(0xe28, 0));
    grate_stream_push(stream, host1x_opcode_imm(0xe29, 0));
 
@@ -313,9 +318,10 @@ grate_draw_vbo(struct pipe_context *pcontext,
       return;
    }
 
-   err = grate_stream_begin(stream);
+   /* draws are batched into one job, flushed by grate_flush_3d() */
+   err = grate_stream_continue(stream);
    if (err < 0) {
-      fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
+      fprintf(stderr, "grate_stream_continue() failed: %d\n", err);
       return;
    }
 
@@ -371,6 +377,13 @@ grate_draw_vbo(struct pipe_context *pcontext,
       return;
    }
 
+   /* same pre-draw sequence as grate-tools / opentegra */
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x1));
+   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x1));
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x2));
+   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x3));
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x3));
+
    /* draw params */
    value  = TGR3D_VAL(DRAW_PARAMS, INDEX_MODE, index_size);
    value |= context->rast->draw_params;
@@ -389,7 +402,8 @@ grate_draw_vbo(struct pipe_context *pcontext,
 
    grate_stream_end(stream);
 
-   grate_stream_flush(stream);
+   if (++stream->num_draws >= 64)
+      grate_flush_3d(context);
 }
 
 void

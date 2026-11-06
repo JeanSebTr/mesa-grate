@@ -798,6 +798,9 @@ int drm_tegra_bo_from_name(struct drm_tegra_bo **bop, struct drm_tegra *drm,
 		goto unlock;
 	}
 
+	list_inithead(&bo->push_list);
+	list_inithead(&bo->bo_list);
+
 	memset(&args, 0, sizeof(args));
 	args.name = name;
 
@@ -883,6 +886,9 @@ int drm_tegra_bo_from_dmabuf(struct drm_tegra_bo **bop, struct drm_tegra *drm,
 		goto unlock;
 	}
 
+	list_inithead(&bo->push_list);
+	list_inithead(&bo->bo_list);
+
 	err = drmPrimeFDToHandle(drm->fd, fd, &handle);
 	if (err) {
 		free(bo);
@@ -899,12 +905,14 @@ int drm_tegra_bo_from_dmabuf(struct drm_tegra_bo **bop, struct drm_tegra *drm,
 		goto unlock;
 	}
 
-	errno = 0;
-	/* lseek() to get bo size */
-	size = lseek(fd, 0, SEEK_END);
-	lseek(fd, 0, SEEK_CUR);
-	/* store lseek() error number */
-	err = -errno;
+	/*
+	 * lseek() to get bo size. dma-buf only supports SEEK_SET and SEEK_END,
+	 * so rewind with SEEK_SET (SEEK_CUR fails with EINVAL).
+	 */
+	off_t end = lseek(fd, 0, SEEK_END);
+	err = end == (off_t)-1 ? -errno : 0;
+	size = end;
+	lseek(fd, 0, SEEK_SET);
 
 	p_atomic_set(&bo->ref, 1);
 	bo->handle = handle;

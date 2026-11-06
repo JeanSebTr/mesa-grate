@@ -66,6 +66,19 @@ grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr)
       .rB_fixed10 = instr->src[1].datatype != FP_DATATYPE_FP20,
       .rB_sub_reg_select_high = instr->src[1].sub_reg_select_high,
 
+      .rA_negate = instr->src[0].negate,
+      .rA_absolute_value = instr->src[0].absolute_value,
+      .rA_scale_by_two = instr->src[0].scale_by_two,
+      .rA_minus_one = instr->src[0].minus_one,
+      .rB_negate = instr->src[1].negate,
+      .rB_absolute_value = instr->src[1].absolute_value,
+      .rB_scale_by_two = instr->src[1].scale_by_two,
+      .rB_minus_one = instr->src[1].minus_one,
+      .rC_negate = instr->src[2].negate,
+      .rC_absolute_value = instr->src[2].absolute_value,
+      .rC_scale_by_two = instr->src[2].scale_by_two,
+      .rC_minus_one = instr->src[2].minus_one,
+
       .rC_reg_select = instr->src[2].index,
       .rC_fixed10 = instr->src[2].datatype != FP_DATATYPE_FP20,
       .rC_sub_reg_select_high = instr->src[2].sub_reg_select_high,
@@ -222,5 +235,31 @@ grate_fp_pack_alu_sched_t114(struct fp_sched *sched)
       .address = sched->address,
       .unk24_31 = 0xe0,
    };
+   return tmp.word;
+}
+
+uint32_t
+grate_fp_pack_tex(struct fp_tex_instr *instr)
+{
+   union {
+      struct __attribute__((packed)) {
+         unsigned sampler_index:4;
+         unsigned src_regs_select:1;
+         unsigned sample_dst_regs_select:1;
+         unsigned unk_6_9:4;
+         unsigned enable:1;
+         unsigned unk_11:1;
+         unsigned enable_bias:1;
+         unsigned unk_13_31:19;
+      };
+
+      uint32_t word;
+   } tmp = {
+      .enable = instr->enable,
+      .sampler_index = instr->sampler,
+      .src_regs_select = instr->coords_from_r2,
+      .sample_dst_regs_select = instr->dst_r2,
+   };
+
    return tmp.word;
 }

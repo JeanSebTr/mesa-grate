@@ -63,6 +63,8 @@ grate_context_destroy(struct pipe_context *pcontext)
 {
    struct grate_context *context = grate_context(pcontext);
 
+   grate_flush_3d(context);
+
    if (context->primconvert)
       util_primconvert_destroy(context->primconvert);
 
@@ -73,12 +75,27 @@ grate_context_destroy(struct pipe_context *pcontext)
    FREE(context);
 }
 
+void
+grate_flush_3d(struct grate_context *context)
+{
+   grate_stream_flush(&context->gr3d->stream);
+}
+
 static void
 grate_context_flush(struct pipe_context *pcontext,
                     struct pipe_fence_handle **pfence,
                     enum pipe_flush_flags flags)
 {
-   unimplemented();
+   /*
+    * Every submission waits for its job to complete (grate_stream_flush()),
+    * so all work is done by now and a fence is always signalled.
+    */
+   static int signalled_fence;
+
+   grate_flush_3d(grate_context(pcontext));
+
+   if (pfence)
+      *pfence = (struct pipe_fence_handle *)&signalled_fence;
 }
 
 struct pipe_context *

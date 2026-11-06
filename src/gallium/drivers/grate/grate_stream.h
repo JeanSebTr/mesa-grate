@@ -53,6 +53,12 @@ struct grate_stream {
    struct grate_command_buffer buffer;
    int num_words;
    uint32_t class_id;
+
+   /* BOs relocated by the pending job, referenced until it is submitted */
+   struct drm_tegra_bo **bos;
+   unsigned num_bos, max_bos;
+   /* draws batched into the pending job */
+   unsigned num_draws;
 };
 
 struct grate_reloc {
@@ -73,6 +79,12 @@ grate_stream_destroy(struct grate_stream *stream);
 
 int
 grate_stream_begin(struct grate_stream *stream);
+
+int
+grate_stream_continue(struct grate_stream *stream);
+
+int
+grate_stream_continue(struct grate_stream *stream);
 
 int
 grate_stream_end(struct grate_stream *stream);

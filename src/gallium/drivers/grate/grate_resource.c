@@ -1,7 +1,9 @@
 #include <stdio.h>
 
+#include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
 #include "util/u_transfer.h"
@@ -42,6 +44,7 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
    resource = grate_resource(presource);
 
    if (handle->type == WINSYS_HANDLE_TYPE_SHARED) {
+      drm_tegra_bo_forbid_caching(resource->bo);
       err = drm_tegra_bo_get_name(resource->bo, &handle->handle);
       if (err < 0) {
          fprintf(stderr, "drm_tegra_bo_get_name() failed: %d\n", err);
@@ -53,12 +56,27 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
          fprintf(stderr, "drm_tegra_bo_get_handle() failed: %d\n", err);
          return FALSE;
       }
+   } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
+      /*
+       * The dma-buf keeps the memory alive after our last reference is
+       * gone: never hand this BO out again from the BO cache, or two
+       * "different" buffers end up sharing memory (a swap chain
+       * rendering into the buffer on screen).
+       */
+      drm_tegra_bo_forbid_caching(resource->bo);
+      err = drm_tegra_bo_to_dmabuf(resource->bo, &handle->handle);
+      if (err < 0) {
+         fprintf(stderr, "drm_tegra_bo_to_dmabuf() failed: %d\n", err);
+         return FALSE;
+      }
+      handle->modifier = DRM_FORMAT_MOD_LINEAR;
    } else {
       fprintf(stdout, "unsupported handle type: %d\n", handle->type);
       return FALSE;
    }
 
    handle->stride = resource->pitch;
+   handle->offset = 0;
    return TRUE;
 }
 
@@ -90,6 +108,8 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    ptrans = slab_alloc(&context->transfer_pool);
    if (!ptrans)
       return NULL;
+
+   grate_flush_3d(context);
 
    if (drm_tegra_bo_map(resource->bo, &ret))
       return NULL;
@@ -186,17 +206,32 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
                          PIPE_BIND_SCANOUT | PIPE_BIND_DEPTH_STENCIL)) {
       if (template->bind & PIPE_BIND_DEPTH_STENCIL)
          resource->pitch = align(resource->pitch, 256);
+      else if (util_is_power_of_two_nonzero(template->width0) &&
+               util_is_power_of_two_nonzero(template->height0))
+         /* the texture sampler derives the row pitch: 16 bytes for POT... */
+         resource->pitch = align(resource->pitch, 16);
       else
-         resource->pitch = align(resource->pitch, 32);
+         /* ...and 64 bytes for NPOT textures (see opentegra tegra_hw_pitch) */
+         resource->pitch = align(resource->pitch, 64);
 
-      flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
+      /*
+       * Buffers shared with other processes or the display hold rows top
+       * down like on any other Linux driver; BOTTOM_UP would make the
+       * display controller scan them out upside down.
+       */
+      if (!(template->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
+         flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
    }
 
    if (template->target != PIPE_BUFFER) {
       /* pick pixel-format */
       int format = grate_pixel_format(template->format);
-      assert(format >= 0);
-      resource->format = format;
+      if (format < 0 && util_format_is_depth_or_stencil(template->format))
+         resource->no_hw_zs = 1;
+      else {
+         assert(format >= 0);
+         resource->format = format;
+      }
    }
 
    size = resource->pitch * height;
@@ -229,10 +264,20 @@ grate_screen_resource_from_handle(struct pipe_screen *pscreen,
    pipe_reference_init(&resource->b.reference, 1);
    resource->b.screen = pscreen;
 
-   err = drm_tegra_bo_from_name(&resource->bo, screen->drm,
-                                handle->handle, 0);
+   if (handle->type == WINSYS_HANDLE_TYPE_FD) {
+      if (handle->modifier != DRM_FORMAT_MOD_INVALID &&
+          handle->modifier != DRM_FORMAT_MOD_LINEAR) {
+         FREE(resource);
+         return NULL;
+      }
+      err = drm_tegra_bo_from_dmabuf(&resource->bo, screen->drm,
+                                     handle->handle, 0);
+   } else
+      err = drm_tegra_bo_from_name(&resource->bo, screen->drm,
+                                   handle->handle, 0);
    if (err < 0) {
-      fprintf(stderr, "drm_tegra_bo_from_name() failed: %d\n", err);
+      fprintf(stderr, "importing BO (handle type %d) failed: %d\n",
+              handle->type, err);
       FREE(resource);
       return NULL;
    }
@@ -278,6 +323,8 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
 
    dst = grate_resource(info->dst.resource);
    src = grate_resource(info->src.resource);
+
+   grate_flush_3d(gr2d->context);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
@@ -366,6 +413,8 @@ fill(struct grate_channel *gr2d,
    uint32_t value;
    int err;
 
+   grate_flush_3d(gr2d->context);
+
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
       fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
@@ -436,16 +485,28 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
       int i;
       for (i = 0; i < fb->nr_cbufs; ++i) {
          struct pipe_surface *dst = fb->cbufs[i];
+         unsigned x0 = 0, y0 = 0, x1 = dst->width, y1 = dst->height;
+
+         /* scissored clear: clients often clear only a damaged area */
+         if (scissor_state) {
+            x0 = MIN2(scissor_state->minx, x1);
+            y0 = MIN2(scissor_state->miny, y1);
+            x1 = MIN2(scissor_state->maxx, x1);
+            y1 = MIN2(scissor_state->maxy, y1);
+            if (x1 <= x0 || y1 <= y0)
+               continue;
+         }
+
          if (fill(context->gr2d, grate_resource(dst->texture),
                   pack_color(dst->format, color->f),
                   util_format_get_blocksize(dst->format),
-                  0, 0, dst->width, dst->height) < 0)
+                  x0, y0, x1 - x0, y1 - y0) < 0)
             return;
       }
    }
 
    if (buffers & PIPE_CLEAR_DEPTH || buffers & PIPE_CLEAR_STENCIL) {
-      if (fb->zsbuf) {
+      if (fb->zsbuf && !grate_resource(fb->zsbuf->texture)->no_hw_zs) {
          /* TODO: handle the case where both are not set! */
          if (fill(context->gr2d, grate_resource(fb->zsbuf->texture),
                   util_pack_z_stencil(fb->zsbuf->format, depth, stencil),
@@ -490,7 +551,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
 static void
 grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
 {
-   unimplemented();
+   grate_flush_3d(grate_context(ctx));
 }
 
 void

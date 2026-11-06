@@ -139,6 +139,13 @@ struct fp_alu_instr_packet {
    struct fp_alu_instr slots[4];
 };
 
+struct fp_tex_instr {
+   bool enable;
+   unsigned sampler;
+   bool coords_from_r2; /* S, T, R, LOD from R2, R3, R0, R1 instead of R0..R3 */
+   bool dst_r2;         /* sampled RGBA (four fx10) to R2-R3 instead of R0-R1 */
+};
+
 struct fp_sched {
    int num_instructions;
    int address;
@@ -146,9 +153,9 @@ struct fp_sched {
 
 struct fp_instr {
    struct list_head link;
-   // TODO: PSEQ
+   uint32_t pseq;
    struct fp_sched mfu_sched;
-   // TODO: TEX
+   struct fp_tex_instr tex;
    struct fp_sched alu_sched;
    struct fp_dw_instr dw;
 };
@@ -158,6 +165,9 @@ grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr);
 
 uint32_t
 grate_fp_pack_dw(struct fp_dw_instr *instr);
+
+uint32_t
+grate_fp_pack_tex(struct fp_tex_instr *instr);
 
 void
 grate_fp_pack_mfu(uint32_t *dst, struct fp_mfu_instr *instr);

@@ -5,6 +5,7 @@
 #include "util/u_bitcast.h"
 #include "util/u_helpers.h"
 #include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
 
 #include "grate_common.h"
@@ -46,7 +47,8 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
    unsigned int i;
    uint32_t mask = 0;
 
-   if (framebuffer->zsbuf) {
+   if (framebuffer->zsbuf &&
+       !grate_resource(framebuffer->zsbuf->texture)->no_hw_zs) {
       struct grate_resource *res = grate_resource(framebuffer->zsbuf->texture);
       uint32_t rt_params;
 
@@ -113,7 +115,7 @@ grate_set_scissor_states(struct pipe_context *pcontext,
                          const struct pipe_scissor_state * scissors)
 {
    assert(num_scissors == 1);
-   unimplemented();
+   grate_context(pcontext)->scissor = scissors[0];
 }
 
 static void
@@ -184,7 +186,51 @@ grate_set_sampler_views(struct pipe_context *pctx, enum pipe_shader_type shader,
                         bool take_ownership,
                         struct pipe_sampler_view **views)
 {
-   unimplemented();
+   struct grate_context *context = grate_context(pctx);
+   unsigned i;
+
+   if (shader != PIPE_SHADER_FRAGMENT)
+      return;
+
+   for (i = 0; i < num_views; i++) {
+      struct pipe_sampler_view *view = views ? views[i] : NULL;
+      if (take_ownership) {
+         pipe_sampler_view_reference(&context->fragment_views[start_slot + i], NULL);
+         context->fragment_views[start_slot + i] = view;
+      } else
+         pipe_sampler_view_reference(&context->fragment_views[start_slot + i], view);
+   }
+   for (; i < num_views + unbind_num_trailing_slots; i++)
+      pipe_sampler_view_reference(&context->fragment_views[start_slot + i], NULL);
+
+   context->num_fragment_views = 0;
+   for (i = 0; i < PIPE_MAX_SHADER_SAMPLER_VIEWS; i++) {
+      if (context->fragment_views[i])
+         context->num_fragment_views = i + 1;
+   }
+}
+
+static struct pipe_sampler_view *
+grate_create_sampler_view(struct pipe_context *pctx, struct pipe_resource *texture,
+                          const struct pipe_sampler_view *template)
+{
+   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
+   if (!view)
+      return NULL;
+
+   *view = *template;
+   view->reference.count = 1;
+   view->texture = NULL;
+   pipe_resource_reference(&view->texture, texture);
+   view->context = pctx;
+   return view;
+}
+
+static void
+grate_sampler_view_destroy(struct pipe_context *pctx, struct pipe_sampler_view *view)
+{
+   pipe_resource_reference(&view->texture, NULL);
+   FREE(view);
 }
 
 static void
@@ -223,6 +269,8 @@ grate_context_state_init(struct pipe_context *pcontext)
    pcontext->set_scissor_states = grate_set_scissor_states;
    pcontext->set_viewport_states = grate_set_viewport_states;
    pcontext->set_sampler_views = grate_set_sampler_views;
+   pcontext->create_sampler_view = grate_create_sampler_view;
+   pcontext->sampler_view_destroy = grate_sampler_view_destroy;
    pcontext->set_vertex_buffers = grate_set_vertex_buffers;
 }
 
@@ -242,7 +290,8 @@ grate_create_blend_state(struct pipe_context *pcontext,
 static void
 grate_bind_blend_state(struct pipe_context *pcontext, void *so)
 {
-   unimplemented();
+   /* applied in the fragment program, see grate_fs_variant() */
+   grate_context(pcontext)->blend = so;
 }
 
 static void
@@ -277,7 +326,19 @@ grate_bind_sampler_states(struct pipe_context *pcontext,
                           unsigned shader, unsigned start_slot,
                           unsigned num_samplers, void **samplers)
 {
-   unimplemented();
+   struct grate_context *context = grate_context(pcontext);
+
+   if (shader != PIPE_SHADER_FRAGMENT)
+      return;
+
+   for (unsigned i = 0; i < num_samplers; i++)
+      context->fragment_samplers[start_slot + i] = samplers ? samplers[i] : NULL;
+
+   context->num_fragment_samplers = 0;
+   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++) {
+      if (context->fragment_samplers[i])
+         context->num_fragment_samplers = i + 1;
+   }
 }
 
 static void
@@ -572,9 +633,16 @@ emit_render_targets(struct grate_context *context)
       grate_stream_push(stream, rt_params);
    }
 
-   grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PTR(0), fb->num_rts));
-   for (i = 0; i < fb->num_rts; ++i)
+   /*
+    * RT 0 is the depth buffer, absent without a zsbuf. The host1x firewall
+    * only accepts relocated values in address registers, so skip it.
+    */
+   for (i = 0; i < fb->num_rts; ++i) {
+      if (!fb->bos[i])
+         continue;
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PTR(i), 1));
       grate_stream_push_reloc(stream, fb->bos[i], 0);
+   }
 
    grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_ENABLE, 1));
    grate_stream_push(stream, fb->mask);
@@ -584,6 +652,22 @@ static void
 emit_scissor(struct grate_context *context)
 {
    struct grate_stream *stream = &context->gr3d->stream;
+
+   if (context->rast && context->rast->base.scissor) {
+      const struct pipe_scissor_state *s = &context->scissor;
+      unsigned w = context->framebuffer.base.width;
+      unsigned h = context->framebuffer.base.height;
+      uint32_t words[3] = {
+         host1x_opcode_incr(TGR3D_SCISSOR_HORIZ, 2),
+         TGR3D_VAL(SCISSOR_HORIZ, MIN, MIN2(s->minx, w)) |
+         TGR3D_VAL(SCISSOR_HORIZ, MAX, MIN2(s->maxx, w)),
+         TGR3D_VAL(SCISSOR_VERT, MIN, MIN2(s->miny, h)) |
+         TGR3D_VAL(SCISSOR_VERT, MAX, MIN2(s->maxy, h)),
+      };
+      grate_stream_push_words(stream, words, 3, 0);
+      return;
+   }
+
    grate_stream_push_words(stream, context->no_scissor, 3, 0);
 }
 
@@ -614,22 +698,34 @@ emit_vs_uniforms(struct grate_context *context)
 {
    struct grate_stream *stream = &context->gr3d->stream;
    struct pipe_constant_buffer *constbuf = &context->constant_buffer[PIPE_SHADER_VERTEX];
-   int len;
+   struct grate_vertex_shader_state *vs = context->vshader;
+   uint32_t consts[256 * 4] = { 0 };
+   int len = 0;
 
    if (constbuf->user_buffer != NULL) {
       assert(constbuf->buffer_size % sizeof(uint32_t) == 0);
 
       len = constbuf->buffer_size / 4;
       assert(len < 256 * 4);
+      memcpy(consts, constbuf->user_buffer, len * 4);
+   }
 
+   /* immediates live at the top of the uniform space, see vp/tgsi.c */
+   for (int i = 0; i < vs->num_immediates; i++)
+      memcpy(&consts[(255 - i) * 4], vs->immediates[i], 4 * sizeof(uint32_t));
+
+   if (vs->num_immediates)
+      len = 256 * 4;
+
+   if (len) {
       grate_stream_push(stream, host1x_opcode_imm(TGR3D_VP_UPLOAD_CONST_ID, 0));
       grate_stream_push(stream, host1x_opcode_nonincr(TGR3D_VP_UPLOAD_CONST, len));
-      grate_stream_push_words(stream, constbuf->user_buffer, len, 0);
+      grate_stream_push_words(stream, consts, len, 0);
    }
 }
 
 static void
-emit_shader(struct grate_stream *stream, struct grate_shader_blob *blob)
+emit_shader(struct grate_stream *stream, const struct grate_shader_blob *blob)
 {
    grate_stream_push_words(stream, blob->commands, blob->num_commands, 0);
 }
@@ -640,7 +736,7 @@ emit_program(struct grate_context *context)
    struct grate_stream *stream = &context->gr3d->stream;
 
    emit_shader(stream, &context->vshader->blob);
-   emit_shader(stream, &context->fshader->blob);
+   emit_shader(stream, grate_fs_variant(context));
 
    uint32_t cull_face_linker_setup = TGR3D_VAL(CULL_FACE_LINKER_SETUP,
                                                UNK_18_31, 0x2e38);
@@ -661,7 +757,21 @@ emit_program(struct grate_context *context)
    linker_insts[2] = host1x_opcode_incr(TGR3D_LINKER_INSTRUCTION(0), info->num_inputs * 2);
 
    for (int i = 0; i < info->num_inputs; ++i) {
-      linker_insts[3 + i * 2] = info->inputs[i].src;
+      /*
+       * Link from the vertex output with the same semantic. Exports are
+       * numbered by rank among the enabled outputs (export 0 = position).
+       */
+      uint32_t src = info->inputs[i].src;
+      struct grate_vertex_shader_state *vs = context->vshader;
+      for (int o = 0; o < 16; o++) {
+         if ((vs->output_mask & (1 << o)) && info->inputs[i].semantic &&
+             vs->output_semantic[o] == info->inputs[i].semantic) {
+            unsigned rank = util_bitcount(vs->output_mask & ((1u << o) - 1));
+            src = (src & ~(0x1f << 3)) | rank << 3;
+            break;
+         }
+      }
+      linker_insts[3 + i * 2] = src;
       linker_insts[3 + i * 2 + 1] = info->inputs[i].dst;
    }
 
@@ -669,6 +779,60 @@ emit_program(struct grate_context *context)
       linker_insts[3 + info->color_input * 2 + 1] |= 0xf << 16;
 
    grate_stream_push_words(stream, linker_insts, ARRAY_SIZE(linker_insts), 0);
+}
+
+static bool
+grate_wrap_clamps(unsigned wrap)
+{
+   return wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE || wrap == PIPE_TEX_WRAP_CLAMP ||
+          wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER;
+}
+
+static void
+emit_textures(struct grate_context *context)
+{
+   struct grate_stream *stream = &context->gr3d->stream;
+
+   for (unsigned i = 0; i < context->num_fragment_views; i++) {
+      struct pipe_sampler_view *view = context->fragment_views[i];
+      struct pipe_sampler_state *sampler = context->fragment_samplers[i];
+      if (!view)
+         continue;
+
+      struct grate_resource *res = grate_resource(view->texture);
+      unsigned width = view->texture->width0;
+      unsigned height = view->texture->height0;
+      bool linear_mag = sampler && sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR;
+      bool linear_min = sampler && sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR;
+      bool clamp_s = !sampler || grate_wrap_clamps(sampler->wrap_s);
+      bool clamp_t = !sampler || grate_wrap_clamps(sampler->wrap_t);
+
+      uint32_t desc1 = TGR3D_VAL(TEXTURE_DESC1, FORMAT, res->format);
+      desc1 |= TGR3D_BOOL(TEXTURE_DESC1, MAGFILTER_LINEAR, linear_mag);
+      desc1 |= TGR3D_BOOL(TEXTURE_DESC1, MINFILTER_LINEAR_WITHIN, linear_min);
+      desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_S_CLAMP_TO_EDGE, clamp_s);
+      desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_T_CLAMP_TO_EDGE, clamp_t);
+      if (sampler) {
+         desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_S_MIRRORED_REPEAT, sampler->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT);
+         desc1 |= TGR3D_BOOL(TEXTURE_DESC1, WRAP_T_MIRRORED_REPEAT, sampler->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT);
+      }
+
+      uint32_t desc2 = TGR3D_BOOL(TEXTURE_DESC2, MIPMAP_DISABLE, 1);
+      if (util_is_power_of_two_nonzero(width) && util_is_power_of_two_nonzero(height)) {
+         desc2 |= TGR3D_VAL(TEXTURE_DESC2, WIDTH_LOG2, util_logbase2(width));
+         desc2 |= TGR3D_VAL(TEXTURE_DESC2, HEIGHT_LOG2, util_logbase2(height));
+      } else {
+         desc2 |= TGR3D_BOOL(TEXTURE_DESC2, NOT_POW2_DIMENSIONS, 1);
+         desc2 |= TGR3D_VAL(TEXTURE_DESC2, WIDTH, width);
+         desc2 |= TGR3D_VAL(TEXTURE_DESC2, HEIGHT, height);
+      }
+
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_TEXTURE_DESC1(i), 2));
+      grate_stream_push(stream, desc1);
+      grate_stream_push(stream, desc2);
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_TEXTURE_POINTER(i), 1));
+      grate_stream_push_reloc(stream, res->bo, 0);
+   }
 }
 
 void
@@ -682,6 +846,7 @@ grate_emit_state(struct grate_context *context)
    emit_attribs(context);
    emit_vs_uniforms(context);
    emit_program(context);
+   emit_textures(context);
 }
 
 void

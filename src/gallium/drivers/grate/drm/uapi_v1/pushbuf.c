@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 /*
  * Copyright © 2012, 2013 Thierry Reding
  * Copyright © 2013 Erik Faye-Lund
@@ -46,6 +48,13 @@ int drm_tegra_pushbuf_queue(struct drm_tegra_pushbuf_private *pushbuf)
 
 	if (!pushbuf || !pushbuf->bo)
 		return 0;
+
+	if (getenv("GRATE_DUMP")) {
+		fprintf(stderr, "DUMP job class=%u words=%ld\n", pushbuf->job->channel->class,
+			(long)(pushbuf->base.ptr - pushbuf->start));
+		for (uint32_t *w = pushbuf->start; w < pushbuf->base.ptr; w++)
+			fprintf(stderr, "DUMP %08x\n", *w);
+	}
 
 	/* unmap buffer object since it won't be accessed anymore */
 	drm_tegra_bo_unmap(pushbuf->bo);

@@ -129,9 +129,13 @@ grate_create_vs_state(struct pipe_context *pcontext,
       offset += 4;
    }
 
+   memcpy(so->immediates, vp.immediates, sizeof(so->immediates));
+   so->num_immediates = vp.num_immediates;
+
    so->blob.commands = commands;
    so->blob.num_commands = num_commands;
    so->output_mask = vp.output_mask;
+   memcpy(so->output_semantic, vp.output_semantic, sizeof(so->output_semantic));
 
    return so;
 }
@@ -148,38 +152,27 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
    FREE(so);
 }
 
-static void *
-grate_create_fs_state(struct pipe_context *pcontext,
-                      const struct pipe_shader_state *template)
+static void
+grate_fs_compile(struct grate_context *context, const struct tgsi_token *tokens,
+                 enum grate_blend_mode mode, struct grate_shader_blob *blob,
+                 struct grate_fp_info *info)
 {
-   struct grate_context *context = grate_context(pcontext);
-   struct grate_fragment_shader_state *so =
-      CALLOC_STRUCT(grate_fragment_shader_state);
-
-   if (!so)
-      return NULL;
-
-   so->base = *template;
-
-   if (grate_debug & GRATE_DEBUG_TGSI) {
-      fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(template->tokens, 0);
-      fprintf(stderr, "\n");
-   }
-
    struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, template->tokens);
+   unsigned ok = tgsi_parse_init(&parser, tokens);
    assert(ok == TGSI_PARSE_OK);
 
    struct grate_fp_shader fp;
    grate_tgsi_to_fp(&fp, &parser);
+   grate_fp_append_blend(&fp, mode);
 
    struct util_dynarray buf;
    util_dynarray_init(&buf, NULL);
 
 #define PUSH(x) util_dynarray_append(&buf, uint32_t, (x))
    PUSH(host1x_opcode_incr(TGR3D_ALU_BUFFER_SIZE, 1));
-   PUSH(0x58000000);
+   /* SIZEx4 = (pseq cfg 0x12c - 1) / (size * 4), matches 0x501 */
+   PUSH(TGR3D_VAL(ALU_BUFFER_SIZE, SIZE, fp.alu_buf_size - 1) |
+        TGR3D_VAL(ALU_BUFFER_SIZE, SIZEx4, (0x12c - 1) / (fp.alu_buf_size * 4)));
 
    PUSH(host1x_opcode_imm(TGR3D_FP_PSEQ_QUAD_ID, 0));
    PUSH(host1x_opcode_imm(TGR3D_FP_UPLOAD_INST_ID_COMMON, 0));
@@ -192,8 +185,16 @@ grate_create_fs_state(struct pipe_context *pcontext,
    PUSH(host1x_opcode_incr(TGR3D_FP_PSEQ_ENGINE_INST, 1));
    PUSH(0x20006000 | num_fp_instrs);
 
+   /* the (1-based) instruction that does the DW */
+   int dw_exec_nb = 1, n = 0;
+   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link) {
+      n++;
+      if (instr->dw.enable)
+         dw_exec_nb = n;
+   }
+
    PUSH(host1x_opcode_incr(TGR3D_FP_PSEQ_DW_CFG, 1));
-   PUSH(0x00000040);
+   PUSH(TGR3D_VAL(FP_PSEQ_DW_CFG, PSEQ_TO_DW_EXEC_NB, dw_exec_nb));
 
    if (context->tegra114) {
       /* XXX: maybe not needed */
@@ -206,7 +207,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
 
    PUSH(host1x_opcode_nonincr(TGR3D_FP_PSEQ_UPLOAD_INST, num_fp_instrs));
    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(0x00000000);
+      PUSH(instr->pseq);
 
    PUSH(host1x_opcode_nonincr(TGR3D_FP_UPLOAD_MFU_SCHED, num_fp_instrs));
    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
@@ -223,10 +224,9 @@ grate_create_fs_state(struct pipe_context *pcontext,
       PUSH(words[1]);
    }
 
-   // TODO: emit actual instructions here
    PUSH(host1x_opcode_nonincr(TGR3D_FP_UPLOAD_TEX_INST, num_fp_instrs));
-   for (int i = 0; i < num_fp_instrs; ++i)
-      PUSH(0x00000000);
+   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
+      PUSH(grate_fp_pack_tex(&instr->tex));
 
    PUSH(host1x_opcode_nonincr(TGR3D_FP_UPLOAD_ALU_SCHED, num_fp_instrs));
    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link) {
@@ -266,10 +266,81 @@ grate_create_fs_state(struct pipe_context *pcontext,
 #undef PUSH
    util_dynarray_trim(&buf);
 
-   so->blob.num_commands = buf.size / sizeof(uint32_t);
-   so->blob.commands = buf.data;
-   so->info = fp.info;
+   blob->num_commands = buf.size / sizeof(uint32_t);
+   blob->commands = buf.data;
+   *info = fp.info;
+}
+
+static void *
+grate_create_fs_state(struct pipe_context *pcontext,
+                      const struct pipe_shader_state *template)
+{
+   struct grate_context *context = grate_context(pcontext);
+   struct grate_fragment_shader_state *so =
+      CALLOC_STRUCT(grate_fragment_shader_state);
+
+   if (!so)
+      return NULL;
+
+   so->base = *template;
+   so->base.tokens = tgsi_dup_tokens(template->tokens);
+
+   if (grate_debug & GRATE_DEBUG_TGSI) {
+      fprintf(stderr, "DEBUG: TGSI:\n");
+      tgsi_dump(template->tokens, 0);
+      fprintf(stderr, "\n");
+   }
+
+   grate_fs_compile(context, so->base.tokens, GRATE_BLEND_NONE,
+                    &so->variants[GRATE_BLEND_NONE], &so->info);
    return so;
+}
+
+static enum grate_blend_mode
+grate_blend_mode(const struct pipe_blend_state *blend)
+{
+   const struct pipe_rt_blend_state *rt = &blend->rt[0];
+
+   if (!rt->blend_enable)
+      return GRATE_BLEND_NONE;
+
+   if (rt->rgb_func == PIPE_BLEND_ADD && rt->alpha_func == PIPE_BLEND_ADD) {
+      bool rgb_one = rt->rgb_src_factor == PIPE_BLENDFACTOR_ONE;
+      bool rgb_sa = rt->rgb_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA;
+      bool a_one = rt->alpha_src_factor == PIPE_BLENDFACTOR_ONE;
+      bool a_sa = rt->alpha_src_factor == PIPE_BLENDFACTOR_SRC_ALPHA;
+
+      if (rt->rgb_dst_factor == PIPE_BLENDFACTOR_ZERO &&
+          rt->alpha_dst_factor == PIPE_BLENDFACTOR_ZERO && rgb_one && a_one)
+         return GRATE_BLEND_NONE;
+
+      if (rt->rgb_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
+          rt->alpha_dst_factor == PIPE_BLENDFACTOR_INV_SRC_ALPHA &&
+          (rgb_one || rgb_sa) && (a_one || a_sa))
+         return GRATE_BLEND_OVER + rgb_sa + 2 * a_sa;
+   }
+
+   static bool warned;
+   if (!warned) {
+      fprintf(stderr, "grate: unsupported blend state, drawing unblended\n");
+      warned = true;
+   }
+   return GRATE_BLEND_NONE;
+}
+
+const struct grate_shader_blob *
+grate_fs_variant(struct grate_context *context)
+{
+   struct grate_fragment_shader_state *fs = context->fshader;
+   enum grate_blend_mode mode =
+      context->blend ? grate_blend_mode(context->blend) : GRATE_BLEND_NONE;
+
+   if (!fs->variants[mode].commands) {
+      struct grate_fp_info info;
+      grate_fs_compile(context, fs->base.tokens, mode, &fs->variants[mode], &info);
+   }
+
+   return &fs->variants[mode];
 }
 
 static void
@@ -281,6 +352,11 @@ grate_bind_fs_state(struct pipe_context *pcontext, void *so)
 static void
 grate_delete_fs_state(struct pipe_context *pcontext, void *so)
 {
+   struct grate_fragment_shader_state *fs = so;
+
+   for (int i = 0; i < GRATE_BLEND_COUNT; i++)
+      FREE(fs->variants[i].commands);
+   FREE((void *)fs->base.tokens);
    FREE(so);
 }
 
