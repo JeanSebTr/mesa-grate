@@ -1909,6 +1909,10 @@ grate_nir_fs_lower(nir_shader *s)
       NIR_PASS(progress, s, nir_opt_constant_folding);
       NIR_PASS(progress, s, nir_opt_dead_cf);
    } while (progress);
+   /* a * b + c is one ALU slot (MAD) */
+   NIR_PASS(_, s, nir_opt_algebraic_late);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_dce);
    /* sample textures and compute values late, next to their users */
    NIR_PASS(_, s, nir_opt_move, nir_move_tex_sample | nir_move_alu |
             nir_move_copies | nir_move_comparisons | nir_move_load_input);
