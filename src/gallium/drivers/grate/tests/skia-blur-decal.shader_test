@@ -1,0 +1,84 @@
+# Skia (GL backend) 16-tap gaussian blur pass with decal edges: each tap
+# clamped to the subset and faded to the border colour outside it
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying highp vec2 vlocalCoord_S0;
+varying highp vec2 vTransformedCoords_2_S0;
+varying mediump vec4 vcolor_S0;
+varying highp float vcoverage_S0;
+varying highp vec4 vgeomSubset_S0;
+void main()
+{
+	gl_Position = piglit_vertex;
+	vlocalCoord_S0 = piglit_vertex.xy * 0.5 + 0.5;
+	vTransformedCoords_2_S0 = vlocalCoord_S0;
+	vcolor_S0 = vec4(1.0);
+	vcoverage_S0 = 1.0;
+	vgeomSubset_S0 = vec4(20.0, 20.0, 230.0, 230.0);
+}
+
+[fragment shader]
+#version 100
+precision mediump float;
+precision mediump sampler2D;
+const highp int kMaxLoopLimit_S1_c0 = 8;
+uniform mediump vec4 uborder_S1_c0_c0_c0;
+uniform highp vec4 uclamp_S1_c0_c0_c0;
+uniform highp vec2 uidims_S1_c0_c0_c0;
+uniform highp mat3 umatrix_S1_c0_c0;
+uniform mediump vec4 uoffsetsAndKernel_S1_c0[14];
+uniform mediump vec2 udir_S1_c0;
+uniform sampler2D uTextureSampler_0_S1;
+varying mediump vec4 vcolor_S0;
+varying highp vec2 vTransformedCoords_2_S0;
+void main() {
+highp vec2 _36_tmp_1_coords = vTransformedCoords_2_S0;
+mediump vec4 _37_sum = vec4(0.0);
+for (highp int _38_i = 0;_38_i < kMaxLoopLimit_S1_c0; ++_38_i) {
+mediump vec4 _39_s = uoffsetsAndKernel_S1_c0[_38_i];
+highp vec2 _40_inCoord = (umatrix_S1_c0_c0 * vec3(_36_tmp_1_coords + _39_s.x * udir_S1_c0, 1.0)).xy;
+highp vec2 _42_clampedCoord = clamp(_40_inCoord, uclamp_S1_c0_c0_c0.xy, uclamp_S1_c0_c0_c0.zw);
+mediump vec4 _43_textureColor = texture2D(uTextureSampler_0_S1, _42_clampedCoord * uidims_S1_c0_c0_c0);
+mediump float _44_errX = _40_inCoord.x - _42_clampedCoord.x;
+mediump float _45_errY = _40_inCoord.y - _42_clampedCoord.y;
+_43_textureColor = mix(_43_textureColor, uborder_S1_c0_c0_c0, min(abs(_44_errX), 1.0));
+_43_textureColor = mix(_43_textureColor, uborder_S1_c0_c0_c0, min(abs(_45_errY), 1.0));
+_37_sum += _39_s.y * _43_textureColor;
+highp vec2 _46_inCoord = (umatrix_S1_c0_c0 * vec3(_36_tmp_1_coords + _39_s.z * udir_S1_c0, 1.0)).xy;
+highp vec2 _48_clampedCoord = clamp(_46_inCoord, uclamp_S1_c0_c0_c0.xy, uclamp_S1_c0_c0_c0.zw);
+mediump vec4 _49_textureColor = texture2D(uTextureSampler_0_S1, _48_clampedCoord * uidims_S1_c0_c0_c0);
+mediump float _50_errX = _46_inCoord.x - _48_clampedCoord.x;
+mediump float _51_errY = _46_inCoord.y - _48_clampedCoord.y;
+_49_textureColor = mix(_49_textureColor, uborder_S1_c0_c0_c0, min(abs(_50_errX), 1.0));
+_49_textureColor = mix(_49_textureColor, uborder_S1_c0_c0_c0, min(abs(_51_errY), 1.0));
+_37_sum += _39_s.w * _49_textureColor;
+}
+gl_FragColor = _37_sum;
+}
+
+[test]
+texture rgbw 0 (8, 8)
+uniform int uTextureSampler_0_S1 0
+uniform vec4 uborder_S1_c0_c0_c0 0.0 0.0 0.0 0.0
+uniform vec4 uclamp_S1_c0_c0_c0 0.0 0.0 1.0 1.0
+uniform vec2 uidims_S1_c0_c0_c0 1.0 1.0
+uniform mat3 umatrix_S1_c0_c0 1.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 1.0
+uniform vec2 udir_S1_c0 0.004 0.0
+uniform vec4 uoffsetsAndKernel_S1_c0[0] -7.5 0.0625 -6.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[1] -5.5 0.0625 -4.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[2] -3.5 0.0625 -2.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[3] -1.5 0.0625 -0.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[4] 0.5 0.0625 1.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[5] 2.5 0.0625 3.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[6] 4.5 0.0625 5.5 0.0625
+uniform vec4 uoffsetsAndKernel_S1_c0[7] 6.5 0.0625 7.5 0.0625
+draw rect -1 -1 2 2
+probe rgba 30 62 1.0 0.0 0.0 1.0
+probe rgba 220 62 0.0 1.0 0.0 1.0
+probe rgba 125 62 0.5 0.5 0.0 1.0
+probe rgba 220 187 1.0 1.0 1.0 1.0
