@@ -285,6 +285,97 @@ grate_init_state(struct grate_context *context)
    return 0;
 }
 
+
+/* one draw (one pass of the fragment program) into the open stream */
+static bool
+grate_draw_one(struct grate_context *context, const struct pipe_draw_info *info,
+               const struct pipe_draw_start_count_bias *draws, unsigned skip,
+               unsigned count)
+{
+   struct pipe_context *pcontext = &context->base;
+   struct grate_stream *stream = &context->gr3d->stream;
+   uint16_t out_mask = context->vshader->output_mask;
+   unsigned int index_size;
+   uint32_t value;
+
+   /*
+    * The state needs to be re-initialized on each draw since tegra doesn't
+    * support context switching in a good way, hardware is optimized for
+    * uploading.
+    */
+   grate_init_state(context);
+   grate_emit_state(context);
+
+   grate_stream_push(stream, host1x_opcode_incr(TGR3D_VP_ATTRIB_IN_OUT_SELECT, 1));
+   grate_stream_push(stream, ((uint32_t)context->vs->mask << 16) | out_mask);
+
+   struct pipe_resource *index_buffer = NULL;
+   unsigned offset = 0;
+   if (info->index_size > 0) {
+      unsigned index_offset = 0;
+      if (info->has_user_indices) {
+         if (!util_upload_index_buffer(pcontext, info, draws, &index_buffer, &index_offset, 64)) {
+            fprintf(stderr, "util_upload_index_buffer() failed\n");
+            return false;
+         }
+      } else
+         index_buffer = info->index.resource;
+
+      index_offset += (draws->start + skip) * info->index_size;
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_INDEX_PTR, 1));
+      grate_stream_push_reloc(stream, grate_resource(index_buffer)->bo, index_offset);
+   } else
+      offset = draws->start + skip;
+
+   switch (info->index_size) {
+   case 0:
+      index_size = 0;
+      break;
+
+   case 1:
+      index_size = 1;
+      break;
+
+   case 2:
+      index_size = 2;
+      break;
+
+   case 4:
+      index_size = 3;
+      break;
+
+   default:
+      fprintf(stderr, "grate_draw_vbo() invalid index size: %u\n",
+              info->index_size);
+      return false;
+   }
+
+   /* same pre-draw sequence as grate-tools / opentegra */
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x1));
+   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x1));
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x2));
+   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x3));
+   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x3));
+
+   /* draw params */
+   value  = TGR3D_VAL(DRAW_PARAMS, INDEX_MODE, index_size);
+   value |= context->rast->draw_params;
+   value |= TGR3D_VAL(DRAW_PARAMS, PRIMITIVE_TYPE, grate_primitive_type(info->mode));
+   value |= TGR3D_VAL(DRAW_PARAMS, FIRST, draws->start);
+   value |= 0xC0000000; /* flush input caches? */
+
+   grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PARAMS, 1));
+   grate_stream_push(stream, value);
+
+   assert(count > 0 && count < (1 << 11));
+   value  = TGR3D_VAL(DRAW_PRIMITIVES, INDEX_COUNT, count - 1);
+   value |= TGR3D_VAL(DRAW_PRIMITIVES, OFFSET, offset);
+   grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PRIMITIVES, 1));
+   grate_stream_push(stream, value);
+
+   return true;
+}
+
 static void
 grate_draw_vbo(struct pipe_context *pcontext,
                const struct pipe_draw_info *info,
@@ -294,11 +385,8 @@ grate_draw_vbo(struct pipe_context *pcontext,
                unsigned num_draws)
 {
    int err;
-   uint32_t value;
    struct grate_context *context = grate_context(pcontext);
    struct grate_stream *stream = &context->gr3d->stream;
-   uint16_t out_mask = context->vshader->output_mask;
-   unsigned int index_size;
 
    if (num_draws > 1) {
       util_draw_multi(pcontext, info, drawid_offset, indirect, draws, num_draws);
@@ -326,81 +414,44 @@ grate_draw_vbo(struct pipe_context *pcontext,
    }
 
    /*
-    * The state needs to be re-initialized on each draw since tegra doesn't
-    * support context switching in a good way, hardware is optimized for
-    * uploading.
+    * A long fragment program runs in several passes, each a draw of its
+    * own; they hand values over through the spill render targets, pixel for
+    * pixel. With blending, the triangles of one draw mustn't see each
+    * other's handed-over values, so each triangle then goes through all
+    * passes before the next one (lists and strips; others aren't split).
     */
-   grate_init_state(context);
-   grate_emit_state(context);
+   struct grate_fragment_shader_state *fs = context->fshader;
+   int passes = fs ? fs->num_segments : 1;
+   bool split = passes > 1 && context->blend &&
+                context->blend->rt[0].blend_enable &&
+                (info->mode == MESA_PRIM_TRIANGLES ||
+                 info->mode == MESA_PRIM_TRIANGLE_STRIP) &&
+                draws[0].count > 3;
+   unsigned step = info->mode == MESA_PRIM_TRIANGLES ? 3 : 1;
+   unsigned num_parts = split ? (info->mode == MESA_PRIM_TRIANGLES ?
+                                 draws[0].count / 3 : draws[0].count - 2) : 1;
 
-   grate_stream_push(stream, host1x_opcode_incr(TGR3D_VP_ATTRIB_IN_OUT_SELECT, 1));
-   grate_stream_push(stream, ((uint32_t)context->vs->mask << 16) | out_mask);
-
-   struct pipe_resource *index_buffer = NULL;
-   unsigned offset = 0;
-   if (info->index_size > 0) {
-      unsigned index_offset = 0;
-      if (info->has_user_indices) {
-         if (!util_upload_index_buffer(pcontext, info, draws, &index_buffer, &index_offset, 64)) {
-            fprintf(stderr, "util_upload_index_buffer() failed\n");
+   for (unsigned part = 0; part < num_parts; part++) {
+      unsigned skip = split ? part * step : 0;
+      unsigned count = split ? 3 : draws[0].count;
+      for (int pass = 0; pass < passes; pass++) {
+         context->fs_pass = pass;
+         if (part || pass) {
+            err = grate_stream_continue(stream);
+            if (err < 0) {
+               fprintf(stderr, "grate_stream_continue() failed: %d\n", err);
+               context->fs_pass = 0;
+               return;
+            }
+         }
+         if (!grate_draw_one(context, info, draws, skip, count)) {
+            context->fs_pass = 0;
             return;
          }
-      } else
-         index_buffer = info->index.resource;
-
-      index_offset += draws->start * info->index_size;
-      grate_stream_push(stream, host1x_opcode_incr(TGR3D_INDEX_PTR, 1));
-      grate_stream_push_reloc(stream, grate_resource(index_buffer)->bo, index_offset);
-   } else
-      offset = draws->start;
-
-   switch (info->index_size) {
-   case 0:
-      index_size = 0;
-      break;
-
-   case 1:
-      index_size = 1;
-      break;
-
-   case 2:
-      index_size = 2;
-      break;
-
-   case 4:
-      index_size = 3;
-      break;
-
-   default:
-      fprintf(stderr, "grate_draw_vbo() invalid index size: %u\n",
-              info->index_size);
-      return;
+         grate_stream_end(stream);
+      }
    }
-
-   /* same pre-draw sequence as grate-tools / opentegra */
-   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x1));
-   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x1));
-   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x2));
-   grate_stream_push(stream, host1x_opcode_imm(0xe41, 0x3));
-   grate_stream_push(stream, host1x_opcode_imm(0xb00, 0x3));
-
-   /* draw params */
-   value  = TGR3D_VAL(DRAW_PARAMS, INDEX_MODE, index_size);
-   value |= context->rast->draw_params;
-   value |= TGR3D_VAL(DRAW_PARAMS, PRIMITIVE_TYPE, grate_primitive_type(info->mode));
-   value |= TGR3D_VAL(DRAW_PARAMS, FIRST, draws->start);
-   value |= 0xC0000000; /* flush input caches? */
-
-   grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PARAMS, 1));
-   grate_stream_push(stream, value);
-
-   assert(draws->count > 0 && draws->count < (1 << 11));
-   value  = TGR3D_VAL(DRAW_PRIMITIVES, INDEX_COUNT, draws->count - 1);
-   value |= TGR3D_VAL(DRAW_PRIMITIVES, OFFSET, offset);
-   grate_stream_push(stream, host1x_opcode_incr(TGR3D_DRAW_PRIMITIVES, 1));
-   grate_stream_push(stream, value);
-
-   grate_stream_end(stream);
+   context->fs_pass = 0;
 
    if (++stream->num_draws >= 64)
       grate_flush_3d(context);

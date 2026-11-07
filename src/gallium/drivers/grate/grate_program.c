@@ -175,22 +175,44 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
    FREE(so);
 }
 
+static void
+grate_fs_build_blob(struct grate_context *context, struct grate_fp_shader *fpp,
+                    struct grate_shader_blob *blob);
+
 static bool
 grate_fs_compile(struct grate_context *context,
                  struct grate_fragment_shader_state *fs,
-                 enum grate_blend_mode mode, struct grate_shader_blob *blob,
-                 struct grate_fp_info *info)
+                 enum grate_blend_mode mode)
 {
-   struct grate_fp_shader fp;
+   struct grate_fp_shader fps[GRATE_FP_MAX_SEGMENTS];
+   int num_segments = 1;
 
    const char *error = NULL;
-   if (!grate_nir_to_fp(&fp, fs->nir, &error)) {
+
+   if (!grate_nir_to_fp(fps, &num_segments, fs->nir, &error)) {
       /* drawn as nothing, see fp/nir.c */
       fprintf(stderr, "grate: fragment shader not supported: %s\n", error);
       if (grate_debug & GRATE_DEBUG_FS)
          nir_print_shader(fs->nir, stderr);
    }
-   grate_fp_append_blend(&fp, mode);
+   /* blending happens in the last pass, the one that writes the colour */
+   grate_fp_append_blend(&fps[num_segments - 1], mode);
+
+   for (int i = 0; i < num_segments; i++) {
+      grate_fs_build_blob(context, &fps[i], &fs->variants[mode][i]);
+      if (mode == GRATE_BLEND_NONE)
+         fs->info[i] = fps[i].info;
+   }
+   if (mode == GRATE_BLEND_NONE)
+      fs->num_segments = num_segments;
+   return true;
+}
+
+static void
+grate_fs_build_blob(struct grate_context *context, struct grate_fp_shader *fpp,
+                    struct grate_shader_blob *blob)
+{
+#define fp (*fpp)
 
    struct util_dynarray buf;
    util_dynarray_init(&buf, NULL);
@@ -307,8 +329,14 @@ grate_fs_compile(struct grate_context *context,
    if (getenv("GRATE_FP_DUMP"))
       for (int i = 0; i < blob->num_commands; i++)
          fprintf(stderr, "DUMP %08x\n", blob->commands[i]);
-   *info = fp.info;
-   return true;
+
+   list_for_each_entry_safe(struct fp_instr, i, &fp.fp_instructions, link)
+      FREE(i);
+   list_for_each_entry_safe(struct fp_alu_instr_packet, p, &fp.alu_instructions, link)
+      FREE(p);
+   list_for_each_entry_safe(struct fp_mfu_instr, m, &fp.mfu_instructions, link)
+      FREE(m);
+#undef fp
 }
 
 static void *
@@ -329,8 +357,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
    if (grate_debug & GRATE_DEBUG_FS)
       nir_print_shader(so->nir, stderr);
 
-   if (!grate_fs_compile(context, so, GRATE_BLEND_NONE,
-                         &so->variants[GRATE_BLEND_NONE], &so->info)) {
+   if (!grate_fs_compile(context, so, GRATE_BLEND_NONE)) {
       ralloc_free(so->nir);
       FREE(so);
       return NULL;
@@ -377,12 +404,10 @@ grate_fs_variant(struct grate_context *context)
    enum grate_blend_mode mode =
       context->blend ? grate_blend_mode(context->blend) : GRATE_BLEND_NONE;
 
-   if (!fs->variants[mode].commands) {
-      struct grate_fp_info info;
-      grate_fs_compile(context, fs, mode, &fs->variants[mode], &info);
-   }
+   if (!fs->variants[mode][0].commands)
+      grate_fs_compile(context, fs, mode);
 
-   return &fs->variants[mode];
+   return &fs->variants[mode][context->fs_pass];
 }
 
 static void
@@ -397,7 +422,8 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *so)
    struct grate_fragment_shader_state *fs = so;
 
    for (int i = 0; i < GRATE_BLEND_COUNT; i++)
-      FREE(fs->variants[i].commands);
+      for (int j = 0; j < GRATE_FP_MAX_SEGMENTS; j++)
+         FREE(fs->variants[i][j].commands);
    ralloc_free(fs->nir);
    FREE(so);
 }

@@ -14,8 +14,16 @@
 #include "grate_program.h"
 #include "grate_resource.h"
 #include "grate_state.h"
+#include "grate_screen.h"
 
 #include "tgr_3d.xml.h"
+
+/*
+ * Not in the register database: two fp16 per pixel, written from (DW) and
+ * read into (PSEQ) one row register pair. Format 0x12 instead holds all
+ * four row registers as RGBA fp16, and a PSEQ from it loads all four.
+ */
+#define GRATE_PIXEL_FORMAT_RG_FP16 0x11
 #include "host1x01_hardware.h"
 
 static void
@@ -631,8 +639,47 @@ emit_render_targets(struct grate_context *context)
       grate_stream_push_reloc(stream, fb->bos[i], 0);
    }
 
+   /*
+    * Register spill slots of the fragment program: render target 4 + i,
+    * linear, framebuffer sized, RGBA8 or RG fp16 (format 0x11, 4 bytes
+    * per pixel). Only the program reads them back, pixel for pixel.
+    */
+   uint32_t mask = fb->mask;
+   const struct grate_fp_info *info = context->fshader ?
+                                      &context->fshader->info[0] : NULL;
+   for (i = 0; info && i < (unsigned)info->num_spill_slots; i++) {
+      bool rgba8 = info->spill_rgba8 & (1u << i);
+      unsigned rt = 4 + i;
+      unsigned pitch = align(fb->base.width * 4, 64);
+      size_t size = (size_t)pitch * MAX2(fb->base.height, 1);
+
+      if (context->spill_size[i] < size) {
+         struct grate_screen *screen = grate_screen(context->base.screen);
+         if (context->spill_bo[i])
+            drm_tegra_bo_unref(context->spill_bo[i]);
+         context->spill_bo[i] = NULL;
+         context->spill_size[i] = 0;
+         if (drm_tegra_bo_new(&context->spill_bo[i], screen->drm, 0, size) < 0) {
+            fprintf(stderr, "grate: no memory for a spill surface\n");
+            context->spill_bo[i] = NULL;
+            continue;
+         }
+         context->spill_size[i] = size;
+      }
+
+      uint32_t rt_params =
+         TGR3D_VAL(RT_PARAMS, FORMAT, rgba8 ? TGR3D_PIXEL_FORMAT_RGBA8888 :
+                                              GRATE_PIXEL_FORMAT_RG_FP16) |
+         TGR3D_VAL(RT_PARAMS, PITCH, pitch);
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PARAMS(rt), 1));
+      grate_stream_push(stream, rt_params);
+      grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_PTR(rt), 1));
+      grate_stream_push_reloc(stream, context->spill_bo[i], 0);
+      mask |= 1u << rt;
+   }
+
    grate_stream_push(stream, host1x_opcode_incr(TGR3D_RT_ENABLE, 1));
-   grate_stream_push(stream, fb->mask);
+   grate_stream_push(stream, mask);
 }
 
 static void
@@ -795,7 +842,7 @@ emit_program(struct grate_context *context)
 
    emit_shader(stream, &context->vshader->blob);
    emit_shader(stream, grate_fs_variant(context));
-   emit_fs_uniforms(context, &context->fshader->info);
+   emit_fs_uniforms(context, &context->fshader->info[context->fs_pass]);
 
    uint32_t cull_face_linker_setup = TGR3D_VAL(CULL_FACE_LINKER_SETUP,
                                                UNK_18_31, 0x2e38);
@@ -804,7 +851,7 @@ emit_program(struct grate_context *context)
    cull_face_linker_setup |= context->rast->cull_face[context->y_invert];
 
    /* depends on linking */
-   struct grate_fp_info *info = &context->fshader->info;
+   struct grate_fp_info *info = &context->fshader->info[context->fs_pass];
    assert(info->num_inputs > 0);
    cull_face_linker_setup |= TGR3D_VAL(CULL_FACE_LINKER_SETUP,
                                        LINKER_INST_COUNT,

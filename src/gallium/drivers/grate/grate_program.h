@@ -22,8 +22,10 @@ struct grate_vertex_shader_state {
 
 struct grate_fragment_shader_state {
    struct pipe_shader_state base;
-   struct grate_shader_blob variants[GRATE_BLEND_COUNT];
-   struct grate_fp_info info;
+   /* per blend mode, one program per pass (see fp/nir.c) */
+   struct grate_shader_blob variants[GRATE_BLEND_COUNT][GRATE_FP_MAX_SEGMENTS];
+   struct grate_fp_info info[GRATE_FP_MAX_SEGMENTS];
+   int num_segments;
    struct nir_shader *nir; /* NIR compiler path, else base.tokens */
 };
 

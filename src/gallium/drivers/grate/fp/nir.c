@@ -53,6 +53,7 @@ enum val_kind {
    VAL_UNIFORM,  /* uniform register 32 + index */
    VAL_FIXED,    /* a fixed source register (fragment position) */
    VAL_VARYING,  /* not interpolated yet: input index, component in .slot */
+   VAL_SPILLED,  /* only in a spill slot (see .spill), reload before use */
 };
 
 struct val {
@@ -66,7 +67,22 @@ struct val {
     * by the later slots of that packet */
    struct fp_alu_instr_packet *pkt;
    int slot;
+   /* uniform table key of a VAL_UNIFORM (the index is per segment) */
+   uint32_t ukey;
+   /* spill slot holding a copy (slot + 1, 0: none) and its place there */
+   int spill;
+   int spill_pos;
 };
+
+/*
+ * Spill slots are render targets 4 and up, one per slot. DW writes a row
+ * register pair to the slot's surface at the fragment's position and a
+ * later PSEQ reads it back into a pair. A fp16 slot (render target format
+ * 0x11, two fp16) keeps the pair's two fp20 values at fp16 precision; an
+ * RGBA8 slot keeps its four fx10 halves (texels, colours) at 8 bits.
+ */
+#define SPILL_RT_FIRST 4
+#define MAX_SPILL_SLOTS GRATE_FP_MAX_SPILL_SLOTS
 
 struct comp {
    struct grate_fp_shader *fp;
@@ -98,6 +114,23 @@ struct comp {
    bool store_packet;
    struct fp_instr *cur;         /* last batch */
    struct fp_mfu_instr *cur_ipl; /* its MFU, if it only interpolates */
+
+   /* spilling: allowed at all, the def of each SSA index, the instruction
+    * being emitted, values that must stay in registers, slot formats */
+   bool allow_spill;
+   nir_def **defs;
+   unsigned cur_index;
+   struct val *protect[12];
+   int nprotect;
+   int num_slots;
+   bool slot_rgba8[MAX_SPILL_SLOTS];
+   /* last batch that reads (PSEQ) or writes (DW) each slot */
+   int slot_last[MAX_SPILL_SLOTS];
+   /* ensure() interpolates dropped varyings (not for TEX coordinates,
+    * which emit_tex() interpolates straight into the pair it reads) */
+   bool ensure_varyings;
+   /* row registers R0-R3 some stage of the last batch reads or writes */
+   unsigned touched;
 };
 
 static struct val *
@@ -221,6 +254,38 @@ last_use_comp(nir_def *def, unsigned comp)
    return last;
 }
 
+/* first instruction after `after` reading component comp of def */
+static unsigned
+next_use_comp(nir_def *def, unsigned comp, unsigned after)
+{
+   unsigned next = UINT_MAX;
+   nir_foreach_use_including_if(u, def) {
+      if (nir_src_is_if(u))
+         continue;
+      nir_instr *i = nir_src_parent_instr(u);
+      if (i->type != nir_instr_type_alu) {
+         if (i->index > after)
+            next = MIN2(next, i->index);
+         continue;
+      }
+      nir_alu_instr *alu = nir_instr_as_alu(i);
+      unsigned s = container_of(u, nir_alu_src, src) - alu->src;
+      if (is_copy(i)) {
+         unsigned n = nir_op_is_vec(alu->op) ? 1 : alu->def.num_components;
+         for (unsigned k = 0; k < n; k++)
+            if (alu->src[s].swizzle[k] == comp)
+               next = MIN2(next, next_use_comp(&alu->def,
+                                               nir_op_is_vec(alu->op) ? s : k,
+                                               after));
+      } else if (i->index > after) {
+         for (unsigned k = 0; k < nir_ssa_alu_instr_src_components(alu, s); k++)
+            if (alu->src[s].swizzle[k] == comp)
+               next = MIN2(next, i->index);
+      }
+   }
+   return next;
+}
+
 static void
 fail(struct comp *c, const char *msg)
 {
@@ -252,6 +317,7 @@ uniform_val(struct comp *c, uint32_t key)
    return (struct val) {
       .kind = VAL_UNIFORM,
       .index = uniform_slot(c, key),
+      .ukey = key,
       .def = -1,
    };
 }
@@ -278,6 +344,7 @@ new_batch(struct comp *c)
    c->pkt = NULL;
    c->cur = inst;
    c->cur_ipl = NULL;
+   c->touched = 0;
    return inst;
 }
 
@@ -330,7 +397,8 @@ operand(struct comp *c, const struct val *v)
       s.sub_reg_select_high = v->high;
       break;
    case VAL_UNIFORM:
-      s.index = REG_UNIFORM + v->index;
+      /* a uniform loaded in an earlier segment: this segment's table */
+      s.index = REG_UNIFORM + uniform_slot(c, v->ukey);
       break;
    case VAL_FIXED:
       s.index = v->index;
@@ -369,17 +437,24 @@ note_use(struct comp *c, struct val *v)
  * users are emitted. Ranges are tracked lazily: a register is reusable once
  * every value in it has seen its last use, which the caller guarantees by
  * calling release() when the SSA def is dead (all uses emitted). */
+static bool spill_any(struct comp *c);
+
 static int
 alloc_reg(struct comp *c, int first, int last_allowed)
 {
-   for (int r = first; r <= last_allowed && r < MAX_ROW_REGS; r++) {
-      if (c->reg_busy_until[r] <= c->num_batches) {
-         c->reg_busy_until[r] = INT_MAX;
-         c->max_reg = MAX2(c->max_reg, r);
-         return r;
+   /* without spilling, allocate past R3 and fail at the end (compile()) */
+   if (c->allow_spill)
+      last_allowed = MIN2(last_allowed, 3);
+   do {
+      for (int r = first; r <= last_allowed && r < MAX_ROW_REGS; r++) {
+         if (c->reg_busy_until[r] <= c->num_batches) {
+            c->reg_busy_until[r] = INT_MAX;
+            c->max_reg = MAX2(c->max_reg, r);
+            return r;
+         }
       }
-   }
-   fail(c, "out of row registers");
+   } while (c->allow_spill && !c->error && spill_any(c));
+   fail(c, "out of row registers (1)");
    return 0;
 }
 
@@ -407,6 +482,11 @@ static void emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
 static struct fp_alu_src_operand operand(struct comp *c, const struct val *v);
 static struct fp_alu_src_operand lowp(bool one);
 
+static int64_t reg_score(struct comp *c, int r, bool *fx10);
+static bool val_varying(struct comp *c, struct val *v, unsigned *loc,
+                        unsigned *comp);
+static bool spill_regs(struct comp *c, int lo, unsigned mask);
+
 /*
  * Move every live value out of row registers [lo, hi] (TEX and DW need
  * fixed registers), into fp20 registers elsewhere.
@@ -423,15 +503,29 @@ evict(struct comp *c, int lo, int hi, struct val *const *keep, int nkeep)
          kept |= keep[k] == v;
       if (kept)
          continue;
+      /* a varying is interpolated again when needed: just drop it (an op
+       * of this batch may still read the register) */
+      unsigned loc, comp;
+      if (c->allow_spill && val_varying(c, v, &loc, &comp)) {
+         *v = (struct val) { .kind = VAL_VARYING, .index = loc, .slot = comp };
+         continue;
+      }
       int r = -1;
-      for (int k = 0; k < MAX_ROW_REGS; k++) {
+      for (int k = 0; k < (c->allow_spill ? 4 : MAX_ROW_REGS); k++) {
          if ((k < lo || k > hi) && c->reg_busy_until[k] <= c->num_batches) {
             r = k;
             break;
          }
       }
+      if (r < 0 && c->allow_spill) {
+         /* nowhere to move it: spill its register instead */
+         bool fx10;
+         if (reg_score(c, v->index, &fx10) >= 0 &&
+             spill_regs(c, v->index & ~1, 1u << (v->index & 1)))
+            continue;
+      }
       if (r < 0) {
-         fail(c, "out of row registers");
+         fail(c, "out of row registers (2)");
          return;
       }
       c->reg_busy_until[r] = INT_MAX;
@@ -445,6 +539,461 @@ evict(struct comp *c, int lo, int hi, struct val *const *keep, int nkeep)
    }
    for (int k = lo; k <= hi; k++)
       c->reg_busy_until[k] = MIN2(c->reg_busy_until[k], c->num_batches);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* spilling */
+
+static bool
+is_protected(struct comp *c, const struct val *v)
+{
+   for (int i = 0; i < c->nprotect; i++)
+      if (c->protect[i] == v)
+         return true;
+   return false;
+}
+
+static void
+protect(struct comp *c, struct val *v)
+{
+   if (c->nprotect < (int)ARRAY_SIZE(c->protect))
+      c->protect[c->nprotect++] = v;
+}
+
+/* next instruction reading the value, from the current one on */
+static unsigned
+val_next_use(struct comp *c, struct val *v)
+{
+   unsigned i = v - c->vals;
+   nir_def *def = c->defs[i / NIR_MAX_VEC_COMPONENTS];
+   if (!def)
+      return UINT_MAX;
+   return next_use_comp(def, i % NIR_MAX_VEC_COMPONENTS,
+                        c->cur_index ? c->cur_index - 1 : 0);
+}
+
+/* a plain fp20 varying component: interpolated again rather than spilled */
+static bool
+val_varying(struct comp *c, struct val *v, unsigned *loc, unsigned *comp)
+{
+   unsigned i = v - c->vals;
+   nir_def *def = c->defs[i / NIR_MAX_VEC_COMPONENTS];
+   if (!def || v->fx10)
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_input &&
+       intr->intrinsic != nir_intrinsic_load_interpolated_input)
+      return false;
+   if (!nir_src_is_const(intr->src[intr->intrinsic ==
+                         nir_intrinsic_load_input ? 0 : 1]))
+      return false;
+   *loc = nir_intrinsic_io_semantics(intr).location;
+   *comp = nir_intrinsic_component(intr) + i % NIR_MAX_VEC_COMPONENTS;
+   return true;
+}
+
+static bool
+slot_in_use(struct comp *c, int slot)
+{
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *v = &c->vals[i];
+      if ((v->kind == VAL_ROW || v->kind == VAL_SPILLED) && v->spill == slot + 1)
+         return true;
+   }
+   return false;
+}
+
+#define SCORE_FREE   INT64_MAX           /* nothing live, not reserved */
+#define SCORE_DROP   ((int64_t)UINT_MAX + 2) /* only varyings: just drop */
+#define SCORE_COPIED ((int64_t)UINT_MAX + 1) /* everything has a slot copy */
+
+/*
+ * How good a victim register r is: -1 can't be spilled, otherwise the
+ * nearest next use of what it holds (farther is better), or one of the
+ * SCORE_* values. *fx10 tells the kind of what it holds.
+ */
+static int64_t
+reg_score(struct comp *c, int r, bool *fx10)
+{
+   bool live = false, copied = true, store = false;
+   unsigned next = UINT_MAX;
+   *fx10 = false;
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *v = &c->vals[i];
+      if (v->kind != VAL_ROW || v->index != r)
+         continue;
+      if (is_protected(c, v))
+         return -1;
+      live = true;
+      unsigned loc, comp;
+      if (val_varying(c, v, &loc, &comp))
+         continue;
+      store = true;
+      *fx10 = v->fx10;
+      copied &= v->spill != 0;
+      next = MIN2(next, val_next_use(c, v));
+   }
+   if (!live)
+      /* a busy register with nothing live in it is reserved by the caller */
+      return c->reg_busy_until[r] <= c->num_batches ? SCORE_FREE : -1;
+   if (!store)
+      return SCORE_DROP;
+   if (copied)
+      return SCORE_COPIED;
+   return next;
+}
+
+/*
+ * Spill registers lo and/or lo + 1 (mask bits 0, 1): varyings are dropped,
+ * values with a slot copy too, the rest DW'd into a slot (one DW if both
+ * registers hold the same kind). The registers are free from the next batch.
+ */
+static bool
+spill_regs(struct comp *c, int lo, unsigned mask)
+{
+   bool fx10[2] = { false, false }, store[2] = { false, false };
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *v = &c->vals[i];
+      unsigned loc, comp;
+      if (v->kind != VAL_ROW || v->index < lo || v->index > lo + 1 ||
+          !(mask & (1u << (v->index - lo))))
+         continue;
+      if (val_varying(c, v, &loc, &comp) || v->spill)
+         continue;
+      store[v->index - lo] = true;
+      fx10[v->index - lo] = v->fx10;
+   }
+
+   int slot_of[2] = { -1, -1 };
+   for (int h = 0; h < 2; h++) {
+      if (!store[h])
+         continue;
+      if (h == 1 && store[0] && fx10[0] == fx10[1]) {
+         slot_of[1] = slot_of[0];
+         continue;
+      }
+      int slot = -1;
+      for (int k = 0; k < c->num_slots && slot < 0; k++)
+         if (c->slot_rgba8[k] == fx10[h] && !slot_in_use(c, k) &&
+             k != slot_of[0])
+            slot = k;
+      if (slot < 0) {
+         if (c->num_slots == MAX_SPILL_SLOTS) {
+            fail(c, "out of spill slots");
+            return false;
+         }
+         slot = c->num_slots++;
+         c->slot_rgba8[slot] = fx10[h];
+      }
+      slot_of[h] = slot;
+      /*
+       * The DW goes in the latest batch before this one that has none and
+       * comes after the values were written (they've sat in the registers
+       * since): the registers are then untouched here, and a reload can
+       * share this batch. Failing that, this batch.
+       */
+      /* and not before the slot's earlier contents were read back */
+      int first = c->slot_last[slot];
+      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+         struct val *v = &c->vals[i];
+         if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1 &&
+             (mask & (1u << (v->index - lo))))
+            first = MAX2(first, v->def);
+      }
+      struct fp_instr *b = NULL;
+      int bi = 0;
+      list_for_each_entry(struct fp_instr, it, &c->fp->fp_instructions, link) {
+         if (bi >= first && bi < c->num_batches - 1 && !it->dw.enable)
+            b = it;
+         bi++;
+      }
+      if (!b) {
+         b = batch_for(c, 4);
+         c->touched |= 3u << lo;
+         /* later ALU ops write the freed registers: not in this batch */
+         c->pkt = NULL;
+      }
+      b->dw.enable = true;
+      b->dw.index = SPILL_RT_FIRST + slot;
+      b->dw.src_regs = lo ? FP_DW_REGS_R2_R3 : FP_DW_REGS_R0_R1;
+      {
+         int idx = 0;
+         list_for_each_entry(struct fp_instr, it, &c->fp->fp_instructions, link) {
+            if (it == b)
+               break;
+            idx++;
+         }
+         c->slot_last[slot] = idx + 1; /* a later DW: a later batch */
+      }
+   }
+
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *v = &c->vals[i];
+      if (v->kind != VAL_ROW || v->index < lo || v->index > lo + 1 ||
+          !(mask & (1u << (v->index - lo))))
+         continue;
+      unsigned loc, comp;
+      if (val_varying(c, v, &loc, &comp)) {
+         *v = (struct val) { .kind = VAL_VARYING, .index = loc, .slot = comp };
+         continue;
+      }
+      if (!v->spill) {
+         v->spill = slot_of[v->index - lo] + 1;
+         v->spill_pos = v->fx10 ? (v->index - lo) * 2 + v->high : v->index - lo;
+      }
+      v->kind = VAL_SPILLED;
+   }
+   for (int h = 0; h < 2; h++)
+      if (mask & (1u << h))
+         c->reg_busy_until[lo + h] = MIN2(c->reg_busy_until[lo + h],
+                                          c->num_batches);
+   return true;
+}
+
+/* spill the best victim register; false if none can go */
+static bool
+spill_any(struct comp *c)
+{
+   int best = -1;
+   int64_t best_score = -1;
+   for (int r = 0; r < 4; r++) {
+      bool fx10;
+      int64_t sc = reg_score(c, r, &fx10);
+      if (sc != SCORE_FREE && sc > best_score) {
+         best = r;
+         best_score = sc;
+      }
+   }
+   if (best < 0)
+      return false;
+   /*
+    * Take the other register of the pair along when it holds the same kind
+    * of value and isn't needed right away: one DW, and the two come back
+    * together (a blur's running sums, say).
+    */
+   unsigned mask = 1u << (best & 1);
+   int other = best ^ 1;
+   bool fb, fo;
+   reg_score(c, best, &fb);
+   int64_t so = reg_score(c, other, &fo);
+   if (so >= 0 && so != SCORE_FREE && fo == fb &&
+       (so >= SCORE_COPIED || so > (int64_t)c->cur_index + 1))
+      mask |= 1u << (other & 1);
+   return spill_regs(c, best & ~1, mask);
+}
+
+static bool
+pair_free(struct comp *c, int lo)
+{
+   return c->reg_busy_until[lo] <= c->num_batches &&
+          c->reg_busy_until[lo + 1] <= c->num_batches;
+}
+
+/*
+ * Values that must stay (an op's sources) can sit in both pairs, so neither
+ * can be spilled whole: move them into the other pair's free registers
+ * (spilling what's there if need be) to empty one pair. Returns that pair,
+ * its registers holding only spillable values now, or -1.
+ */
+static int
+compact_pair(struct comp *c)
+{
+   for (int q = 0; q <= 2; q += 2) {
+      int o = 2 - q;
+      int need = 0, room = 0;
+      bool ok = true;
+      for (int h = 0; h < 2; h++) {
+         bool f;
+         int64_t sq = reg_score(c, q + h, &f), so = reg_score(c, o + h, &f);
+         if (sq < 0) {
+            /* protected (or reserved): only a protected fp20 value moves */
+            bool movable = false;
+            for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+               struct val *v = &c->vals[i];
+               if (v->kind == VAL_ROW && v->index == q + h)
+                  movable = !v->fx10;
+            }
+            ok &= movable;
+            need++;
+         }
+         if (so >= 0)
+            room++;
+      }
+      if (!ok || need > room)
+         continue;
+      for (int h = 0; h < 2; h++) {
+         bool f;
+         if (reg_score(c, q + h, &f) >= 0)
+            continue;
+         int r = -1;
+         for (int k = 0; k < 2 && r < 0; k++) {
+            int64_t so = reg_score(c, o + k, &f);
+            if (so == SCORE_FREE)
+               r = o + k;
+         }
+         for (int k = 0; k < 2 && r < 0; k++) {
+            if (reg_score(c, o + k, &f) >= 0 &&
+                spill_regs(c, o, 1u << k))
+               r = o + k;
+         }
+         if (r < 0)
+            return -1;
+         for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+            struct val *v = &c->vals[i];
+            if (v->kind != VAL_ROW || v->index != q + h)
+               continue;
+            c->reg_busy_until[r] = INT_MAX;
+            struct val moved = *v;
+            moved.index = r;
+            moved.def = c->num_batches;
+            moved.pkt = NULL;
+            emit_mad(c, &moved, FP_ALU_OP_MAD, operand(c, v), lowp(true),
+                     lowp(false), false);
+            moved.last = c->num_batches;
+            *v = moved;
+         }
+         c->reg_busy_until[q + h] = MIN2(c->reg_busy_until[q + h],
+                                         c->num_batches);
+      }
+      /* the moved values show from the next batch on */
+      c->pkt = NULL;
+      return q;
+   }
+   return -1;
+}
+
+/* make a whole pair free, spilling the cheaper one; -1 if neither can be */
+static int
+free_pair(struct comp *c)
+{
+   int best = -1;
+   int64_t best_score = -1;
+   for (int lo = 0; lo <= 2; lo += 2) {
+      bool f0, f1;
+      int64_t s0 = reg_score(c, lo, &f0), s1 = reg_score(c, lo + 1, &f1);
+      int64_t sc = MIN2(s0, s1);
+      if (sc > best_score) {
+         best = lo;
+         best_score = sc;
+      }
+   }
+   if (best < 0 && c->allow_spill)
+      best = compact_pair(c);
+   if (best < 0 || !c->allow_spill)
+      return -1;
+   if (pair_free(c, best))
+      return best;
+   unsigned mask = 0;
+   for (int h = 0; h < 2; h++)
+      if (c->reg_busy_until[best + h] > c->num_batches)
+         mask |= 1u << h;
+   if (!spill_regs(c, best, mask))
+      return -1;
+   return best;
+}
+
+/* PSEQ a slot back into a free pair, with everything still live in it */
+static void
+reload(struct comp *c, struct val *v)
+{
+   int slot = v->spill - 1;
+   int q = free_pair(c);
+   if (q < 0) {
+      fail(c, "out of row registers (3)");
+      return;
+   }
+
+   /*
+    * PSEQ is the first stage: it can join the last batch if that has none
+    * and no stage of it touches the pair (PSEQ overwrites it before they
+    * run); otherwise a fresh batch.
+    */
+   struct fp_instr *b = c->cur;
+   if (!b || b->pseq || (c->touched & (3u << q)))
+      b = new_batch(c);
+   c->touched |= 3u << q;
+   b->pseq = 0x00800008 | (q ? 0x2 : 0x0) | (SPILL_RT_FIRST + slot) << 16;
+   /* a DW in this batch runs after the PSEQ: fine */
+   c->slot_last[slot] = MAX2(c->slot_last[slot], c->num_batches - 1);
+   c->max_reg = MAX2(c->max_reg, q + 1);
+
+   bool rgba8 = c->slot_rgba8[slot];
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *w = &c->vals[i];
+      if (w->kind != VAL_SPILLED || w->spill != slot + 1)
+         continue;
+      w->kind = VAL_ROW;
+      w->index = q + (rgba8 ? w->spill_pos / 2 : w->spill_pos);
+      w->fx10 = rgba8;
+      w->high = rgba8 && (w->spill_pos & 1);
+      w->def = c->num_batches - 1;
+      w->last = c->num_batches;
+      w->pkt = NULL;
+      c->reg_busy_until[w->index] = INT_MAX;
+   }
+}
+
+/* at least n of R0-R3 free, spilling if need be */
+static void
+make_free(struct comp *c, int n)
+{
+   for (;;) {
+      int nfree = 0;
+      for (int r = 0; r < 4; r++)
+         nfree += c->reg_busy_until[r] <= c->num_batches;
+      if (nfree >= n || !c->allow_spill || !spill_any(c))
+         return;
+   }
+}
+
+/* a value about to be read: back into a register if it was spilled */
+static int place(struct comp *c, unsigned location, int n, const int *j,
+                 const int *want, int *reg);
+static void emit_interpolation(struct comp *c, int e, int n, const int *reg);
+
+static void
+ensure(struct comp *c, struct val *v)
+{
+   if (v->kind == VAL_SPILLED)
+      reload(c, v);
+   if (v->kind == VAL_VARYING && c->ensure_varyings) {
+      int j = v->slot, want = -1, reg;
+      make_free(c, 1);
+      int e = place(c, v->index, 1, &j, &want, &reg);
+      if (e < 0)
+         return;
+      emit_interpolation(c, e, 1, &reg);
+      *v = (struct val) { .kind = VAL_ROW, .index = reg,
+                          .def = c->num_batches - 1, .last = c->num_batches };
+   }
+}
+
+/* every scalar source of instr in registers, and kept there */
+static bool
+ensure_src(nir_src *src, void *data)
+{
+   struct comp *c = data;
+   /* the components an ALU op reads, or all of them */
+   unsigned comps[NIR_MAX_VEC_COMPONENTS], n = 0;
+   nir_instr *user = nir_src_parent_instr(src);
+   if (user->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(user);
+      unsigned s = container_of(src, nir_alu_src, src) - alu->src;
+      for (unsigned k = 0; k < nir_ssa_alu_instr_src_components(alu, s); k++)
+         comps[n++] = alu->src[s].swizzle[k];
+   } else {
+      for (unsigned k = 0; k < src->ssa->num_components; k++)
+         comps[n++] = k;
+   }
+   for (unsigned k = 0; k < n; k++)
+      protect(c, src_val(c, *src, comps[k]));
+   for (unsigned k = 0; k < n; k++)
+      ensure(c, src_val(c, *src, comps[k]));
+   return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -603,22 +1152,32 @@ place(struct comp *c, unsigned location, int n, const int *j, const int *want,
 static void
 emit_interpolation(struct comp *c, int e, int n, const int *reg)
 {
+   /*
+    * MFU runs before TEX, ALU and DW: interpolation can join the last
+    * batch if no stage of it touches the registers it writes.
+    */
+   unsigned regs = 0;
+   for (int k = 0; k < n; k++)
+      regs |= 1u << reg[k];
+   bool fits = c->cur && !(c->touched & regs);
+
    /* join the interpolation the current batch already does */
-   struct fp_mfu_instr *prev = c->cur_ipl;
+   struct fp_mfu_instr *prev = fits ? c->cur_ipl : NULL;
    for (int k = 0; k < n && prev; k++)
       if (prev->var[reg[k]].op != FP_VAR_OP_NOP)
          prev = NULL;
-   if (prev && c->cur->tex.enable == false && !c->cur->alu_sched.num_instructions &&
-       !c->cur->dw.enable) {
+   if (prev) {
       for (int k = 0; k < n; k++) {
          prev->var[reg[k]].op = FP_VAR_OP_FP20;
          prev->var[reg[k]].tram_row = c->input_row[e];
          c->reg_busy_until[reg[k]] = INT_MAX;
          c->max_reg = MAX2(c->max_reg, reg[k]);
       }
+      c->touched |= regs;
       return;
    }
-   struct fp_instr *inst = batch_for(c, 1);
+   struct fp_instr *inst = fits && !c->cur->mfu_sched.num_instructions ?
+                           c->cur : batch_for(c, 1);
    struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
    list_inithead(&mfu->link);
    setup_barycentrics(mfu);
@@ -629,6 +1188,7 @@ emit_interpolation(struct comp *c, int e, int n, const int *reg)
       c->reg_busy_until[reg[k]] = INT_MAX;
       c->max_reg = MAX2(c->max_reg, reg[k]);
    }
+   c->touched |= regs;
    list_addtail(&mfu->link, &c->fp->mfu_instructions);
    inst->mfu_sched.num_instructions = 1;
 }
@@ -681,6 +1241,7 @@ emit_load_input(struct comp *c, nir_intrinsic_instr *intr)
          e = new_entry(c, sem.location);
          if (e < 0)
             return;
+         make_free(c, 2);
          int regs[2], n = 0;
          for (int t = 0; t < 4 && n < 2; t++)
             if (c->reg_busy_until[t] <= c->num_batches)
@@ -738,6 +1299,7 @@ emit_load_input(struct comp *c, nir_intrinsic_instr *intr)
    int want[4] = { -1, -1, -1, -1 }, reg[4];
    for (int k = 0; k < n; k++)
       j[k] = first + k;
+   make_free(c, n);
    int e = place(c, sem.location, n, j, want, reg);
    if (e < 0)
       return;
@@ -836,6 +1398,11 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
 
    int k = c->pkt_slots++;
    struct fp_alu_instr *slot = &c->pkt->slots[k];
+   if (dst->index < 4)
+      c->touched |= 1u << dst->index;
+   for (int i = 0; i < 3; i++)
+      if (srcs[i]->index < 4)
+         c->touched |= 1u << srcs[i]->index;
    slot->op = op;
    slot->dst = dst_of(dst, sat);
    slot->src[0] = a;
@@ -913,6 +1480,7 @@ emit_sfu(struct comp *c, struct val *dst, enum fp_sfu_op op, struct val *src)
    list_inithead(&mfu->link);
    mfu->sfu.op = op;
    mfu->sfu.reg = src->index;
+   c->touched |= (1u << src->index) | (1u << dst->index);
    mfu->mul[0].dst = FP_MFU_MUL_DST_ROW_REG_0 + dst->index;
    mfu->mul[0].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
    mfu->mul[0].src[1] = FP_MFU_MUL_SRC_CONST_1;
@@ -1012,6 +1580,7 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
       } else {
          *dst = new_row_val(c);
       }
+      protect(c, dst);
 
       struct fp_alu_src_operand zero = lowp(false), one = lowp(true);
 
@@ -1225,6 +1794,7 @@ emit_intrinsic(struct comp *c, nir_intrinsic_instr *intr)
       c->store_packet = false;
       struct fp_instr *dw = batch_for(c, 4);
       dw->dw.enable = 1;
+      c->touched |= 0xc;
       dw->dw.index = 1;
       dw->dw.src_regs = FP_DW_REGS_R2_R3;
       break;
@@ -1281,6 +1851,7 @@ materialize_coords(struct comp *c, nir_tex_instr *tex, int coord)
       if (v->kind != VAL_VARYING)
          continue;
       int j = v->slot, want = -1, reg;
+      make_free(c, 1);
       int e = place(c, v->index, 1, &j, &want, &reg);
       if (e < 0)
          return false;
@@ -1346,14 +1917,21 @@ emit_tex(struct comp *c, nir_tex_instr *tex)
       q = 2;
    else {
       q = pair_live_after(c, 2, tex, coord) < pair_live_after(c, 0, tex, coord) ? 2 : 0;
-      evict(c, q, q + 1, NULL, 0);
+      /* coordinates already in the pair stay: one packet reads both
+       * before it writes either */
+      struct val *cv[2] = { src_val(c, tex->src[coord].src, 0),
+                            src_val(c, tex->src[coord].src, 1) };
+      evict(c, q, q + 1, cv, 2);
+      c->pkt = NULL;
+      c->store_packet = true;
       for (int k = 0; k < 2; k++) {
-         struct val *s = src_val(c, tex->src[coord].src, k);
+         struct val *s = cv[k];
          note_use(c, s);
          struct val d = { .kind = VAL_ROW, .index = q + k };
          emit_mad(c, &d, FP_ALU_OP_MAD, operand(c, s), lowp(true), lowp(false),
                   false);
       }
+      c->store_packet = false;
       c->reg_busy_until[q] = c->reg_busy_until[q + 1] = INT_MAX;
    }
    for (int k = 0; k < 2; k++)
@@ -1362,14 +1940,21 @@ emit_tex(struct comp *c, nir_tex_instr *tex)
    /* ties go to R2-R3: the texel is then laid out as the colour output */
    int p = pair_live_after(c, 2, tex, coord) <= pair_live_after(c, 0, tex, coord) ? 2 : 0;
    if (pair_live_after(c, p, tex, coord)) {
-      /* keep the coordinates readable by the TEX batch: they're in q */
-      struct val *keep[2] = { src_val(c, tex->src[coord].src, 0),
-                              src_val(c, tex->src[coord].src, 1) };
-      evict(c, p, p + 1, p == q ? NULL : keep, p == q ? 0 : 2);
+      /* keep the coordinates readable by the TEX batch: they're in q; in
+       * the same pair, only those TEX reads last need no moving */
+      struct val *keep[2];
+      int nkeep = 0;
+      for (int k = 0; k < 2; k++) {
+         nir_scalar sc = chase_plain(tex->src[coord].src.ssa, k);
+         if (p != q || last_use_comp(sc.def, sc.comp) <= tex->instr.index)
+            keep[nkeep++] = src_val(c, tex->src[coord].src, k);
+      }
+      evict(c, p, p + 1, keep, nkeep);
    }
 
    struct fp_instr *inst = batch_for(c, 2);
    inst->tex.enable = true;
+   c->touched |= (3u << q) | (3u << p);
    inst->tex.sampler = tex->sampler_index;
    inst->tex.coords_from_r2 = q == 2;
    inst->tex.dst_r2 = p == 2;
@@ -1413,6 +1998,10 @@ free_dead(nir_src *src, void *data)
       if (last_use_comp(s.def, s.comp) > user->index)
          continue;
       struct val *v = def_val(c, s.def, s.comp);
+      if (v->kind == VAL_SPILLED) {
+         v->kind = VAL_NONE;
+         continue;
+      }
       if (v->kind != VAL_ROW)
          continue;
       v->kind = VAL_NONE;
@@ -1610,11 +2199,10 @@ embed_immediates(struct comp *c)
       fail(c, "too many fragment uniforms");
 }
 
-static bool
-compile(struct grate_fp_shader *fp, nir_shader *s, const char **error)
+static void
+segment_begin(struct comp *c, struct grate_fp_shader *fp)
 {
-   struct comp c = { .fp = fp, .nir = s };
-
+   c->fp = fp;
    list_inithead(&fp->fp_instructions);
    list_inithead(&fp->alu_instructions);
    list_inithead(&fp->mfu_instructions);
@@ -1622,6 +2210,98 @@ compile(struct grate_fp_shader *fp, nir_shader *s, const char **error)
    memset(&fp->info, 0, sizeof(fp->info));
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+
+   c->num_batches = 0;
+   memset(c->reg_busy_until, 0, sizeof(c->reg_busy_until));
+   c->max_reg = 0;
+   c->pkt = NULL;
+   c->pkt_slots = 0;
+   c->pkt_rows_written = 0;
+   c->pkt_halves_written = 0;
+   c->cur = NULL;
+   c->cur_ipl = NULL;
+   c->touched = 0;
+   for (int i = 0; i < 16; i++) {
+      c->input_row[i] = c->input_loc[i] = -1;
+      c->tram_used[i] = 0;
+      for (int j = 0; j < 4; j++)
+         c->input_reg[i][j] = -1;
+   }
+   /* the slots were written by an earlier pass, if at all */
+   memset(c->slot_last, 0, sizeof(c->slot_last));
+}
+
+/* everything still in a register goes to a spill slot, for the next pass */
+static void
+spill_all(struct comp *c)
+{
+   c->nprotect = 0;
+   for (int lo = 0; lo <= 2 && !c->error; lo += 2) {
+      unsigned mask = 0;
+      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+         struct val *v = &c->vals[i];
+         if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1)
+            mask |= 1u << (v->index - lo);
+      }
+      if (mask)
+         spill_regs(c, lo, mask);
+   }
+}
+
+static void
+segment_end(struct comp *c)
+{
+   struct grate_fp_shader *fp = c->fp;
+
+   /* a program needs at least one batch (a shader with no output has none) */
+   if (!c->num_batches)
+      new_batch(c);
+
+   if (!c->error)
+      embed_immediates(c);
+   if (!c->error && c->num_batches > 63)
+      fail(c, "program too long");
+
+   /* the linker needs at least one instruction */
+   if (!fp->info.num_inputs) {
+      fp->info.inputs[0].src = LINK_SRC(0);
+      fp->info.num_inputs = 1;
+   }
+
+   fp->alu_buf_size = DIV_ROUND_UP(c->max_reg + 1, 4);
+   /* more ALU buffer rows (R4 and up) hang GR3D */
+   if (!c->error && fp->alu_buf_size > 1)
+      fail(c, "needs more than four row registers");
+}
+
+static void
+fp_clear(struct grate_fp_shader *fp)
+{
+   list_for_each_entry_safe(struct fp_instr, i, &fp->fp_instructions, link)
+      FREE(i);
+   list_for_each_entry_safe(struct fp_alu_instr_packet, p, &fp->alu_instructions, link)
+      FREE(p);
+   list_for_each_entry_safe(struct fp_mfu_instr, m, &fp->mfu_instructions, link)
+      FREE(m);
+   list_inithead(&fp->fp_instructions);
+   list_inithead(&fp->alu_instructions);
+   list_inithead(&fp->mfu_instructions);
+}
+
+/*
+ * Compile into up to max_segments programs (passes). A pass ends once it
+ * holds `cut` batches or `ucut` uniforms: what's live then goes to spill
+ * slots and the next pass reads it back. *num_segments is set on success.
+ */
+static bool
+compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
+        int *num_segments, nir_shader *s, bool allow_spill, const char **error)
+{
+   struct comp c = { .nir = s };
+   struct grate_fp_shader *fp = &fps[0];
+   int seg = 0;
+
+   segment_begin(&c, fp);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
    if (!nir_cf_list_is_empty_block(&impl->body) &&
@@ -1635,14 +2315,41 @@ compile(struct grate_fp_shader *fp, nir_shader *s, const char **error)
    c.num_defs = impl->ssa_alloc;
    c.vals = CALLOC(c.num_defs * NIR_MAX_VEC_COMPONENTS, sizeof(struct val));
 
-   for (int i = 0; i < 16; i++)
-      c.input_row[i] = c.input_loc[i] = -1;
-
+   c.allow_spill = allow_spill;
+   c.defs = CALLOC(c.num_defs, sizeof(nir_def *));
+   nir_foreach_block(block, impl)
+      nir_foreach_instr(instr, block) {
+         nir_def *d = nir_instr_def(instr);
+         if (d)
+            c.defs[d->index] = d;
+      }
 
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (c.error)
             break;
+         c.cur_index = instr->index;
+         c.nprotect = 0;
+
+         /* a full pass: hand over to the next one */
+         if (seg + 1 < max_segments && !is_copy(instr) &&
+             instr->type != nir_instr_type_load_const &&
+             (c.num_batches >= cut || c.fp->info.num_uniforms >= ucut)) {
+            spill_all(&c);
+            segment_end(&c);
+            if (c.error)
+               break;
+            fp = &fps[++seg];
+            segment_begin(&c, fp);
+            c.cur_index = instr->index;
+            c.nprotect = 0;
+         }
+
+         /* spilled sources back into registers first */
+         if (c.allow_spill && !is_copy(instr)) {
+            c.ensure_varyings = instr->type != nir_instr_type_tex;
+            nir_foreach_src(instr, ensure_src, &c);
+         }
          /*
           * An ALU op reads its sources in its first batch, so a source
           * that dies here can hand its register to the result.
@@ -1669,34 +2376,24 @@ compile(struct grate_fp_shader *fp, nir_shader *s, const char **error)
             break;
          default:
             fail(&c, "unsupported instruction type");
-         if (getenv("GRATE_NIR_FS_DEBUG")) nir_print_instr(instr, stderr);
             break;
          }
          nir_foreach_src(instr, free_dead, &c);
       }
    }
 
-   /* a program needs at least one batch (a shader with no output has none) */
-   if (!c.num_batches)
-      new_batch(&c);
-
    if (!c.error)
-      embed_immediates(&c);
-   if (!c.error && c.num_batches > 63)
-      fail(&c, "program too long");
+      segment_end(&c);
 
-   /* the linker needs at least one instruction */
-   if (!fp->info.num_inputs) {
-      fp->info.inputs[0].src = LINK_SRC(0);
-      fp->info.num_inputs = 1;
+   for (int k = 0; k <= seg; k++) {
+      fps[k].info.num_spill_slots = c.num_slots;
+      for (int i = 0; i < c.num_slots; i++)
+         if (c.slot_rgba8[i])
+            fps[k].info.spill_rgba8 |= 1u << i;
    }
 
-   fp->alu_buf_size = DIV_ROUND_UP(c.max_reg + 1, 4);
-   /* more ALU buffer rows (R4 and up) hang GR3D */
-   if (!c.error && fp->alu_buf_size > 1)
-      fail(&c, "needs more than four row registers");
-
    FREE(c.vals);
+   FREE(c.defs);
    *error = c.error;
 
    if (c.error && getenv("GRATE_FP_DUMP_FAILED")) {
@@ -1724,24 +2421,15 @@ compile(struct grate_fp_shader *fp, nir_shader *s, const char **error)
    }
    if (c.error) {
       /* Gallium can't fail a shader: draw nothing instead */
-      list_for_each_entry_safe(struct fp_instr, i, &fp->fp_instructions, link)
-         FREE(i);
-      list_for_each_entry_safe(struct fp_alu_instr_packet, p, &fp->alu_instructions, link)
-         FREE(p);
-      list_for_each_entry_safe(struct fp_mfu_instr, m, &fp->mfu_instructions, link)
-         FREE(m);
-      list_inithead(&fp->fp_instructions);
-      list_inithead(&fp->alu_instructions);
-      list_inithead(&fp->mfu_instructions);
-      memset(&fp->info, 0, sizeof(fp->info));
-      fp->info.color_input = -1;
-      fp->info.max_tram_row = 1;
-      fp->info.inputs[0].src = LINK_SRC(0);
-      fp->info.num_inputs = 1;
-      fp->alu_buf_size = 1;
-      c.num_batches = 0;
+      for (int k = 0; k <= seg; k++)
+         fp_clear(&fps[k]);
+      segment_begin(&c, &fps[0]);
+      fps[0].info.inputs[0].src = LINK_SRC(0);
+      fps[0].info.num_inputs = 1;
       new_batch(&c);
+      seg = 0;
    }
+   *num_segments = seg + 1;
    return !c.error;
 }
 
@@ -1850,6 +2538,173 @@ reorder_depth_first(nir_shader *s)
    return true;
 }
 
+
+/*
+ * Reorder top-down, greedily: of the instructions whose sources are ready,
+ * take the one that frees the most register space (its sources' last
+ * reader) for the least it takes. Space is counted in fx10 halves (an fp20
+ * value takes two) per component, so a sum of texture taps finishes each
+ * tap before fetching the next, instead of one channel over every tap.
+ */
+static unsigned
+pressure_unit(nir_instr *instr)
+{
+   switch (instr->type) {
+   case nir_instr_type_alu:
+      return is_copy(instr) ? 0 : 2;
+   case nir_instr_type_tex:
+      return 1;
+   case nir_instr_type_intrinsic:
+      return nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_frag_coord ? 2 : 0;
+   default:
+      return 0;
+   }
+}
+
+static unsigned
+pressure_cost(nir_instr *instr)
+{
+   nir_def *def = nir_instr_def(instr);
+   return def ? pressure_unit(instr) * def->num_components : 0;
+}
+
+/* the scalars (underlying def instruction index * 4 + component) instr
+ * reads, through copies, without repeats */
+struct pressure_reads {
+   unsigned key[64];
+   unsigned n;
+};
+
+static bool
+pressure_collect(nir_src *src, void *data)
+{
+   struct pressure_reads *r = data;
+   nir_instr *user = nir_src_parent_instr(src);
+   unsigned comps[NIR_MAX_VEC_COMPONENTS], n = 0;
+   if (user->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(user);
+      unsigned si = container_of(src, nir_alu_src, src) - alu->src;
+      for (unsigned k = 0; k < nir_ssa_alu_instr_src_components(alu, si); k++)
+         comps[n++] = alu->src[si].swizzle[k];
+   } else {
+      for (unsigned k = 0; k < src->ssa->num_components; k++)
+         comps[n++] = k;
+   }
+   for (unsigned k = 0; k < n; k++) {
+      nir_scalar sc = chase_plain(src->ssa, comps[k]);
+      unsigned key = nir_def_instr(sc.def)->index * 4 + sc.comp;
+      bool seen = false;
+      for (unsigned i = 0; i < r->n; i++)
+         seen |= r->key[i] == key;
+      if (!seen && r->n < ARRAY_SIZE(r->key))
+         r->key[r->n++] = key;
+   }
+   return true;
+}
+
+static void
+pressure_reads_of(nir_instr *instr, struct pressure_reads *r)
+{
+   r->n = 0;
+   if (!is_copy(instr))
+      nir_foreach_src(instr, pressure_collect, r);
+}
+
+static bool
+pressure_unready_src(nir_src *src, void *data)
+{
+   unsigned *n = data;
+   (*n)++;
+   return true;
+}
+
+static bool
+reorder_pressure(nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   if (!exec_list_is_singular(&impl->body))
+      return false;
+   nir_block *block = nir_start_block(impl);
+   nir_index_instrs(impl);
+
+   unsigned count = 0;
+   nir_foreach_instr(instr, block)
+      count = instr->index + 1;
+   nir_instr **by_index = calloc(count, sizeof(nir_instr *));
+   unsigned *remaining = calloc(count * 4, sizeof(unsigned));
+   unsigned *unready = calloc(count, sizeof(unsigned));
+   bool *done = calloc(count, sizeof(bool));
+   nir_instr **order = calloc(count, sizeof(nir_instr *));
+   unsigned n = 0;
+   struct pressure_reads r;
+
+   nir_foreach_instr(instr, block) {
+      by_index[instr->index] = instr;
+      nir_foreach_src(instr, pressure_unready_src, &unready[instr->index]);
+      pressure_reads_of(instr, &r);
+      for (unsigned i = 0; i < r.n; i++)
+         remaining[r.key[i]]++;
+   }
+
+   while (n < count) {
+      nir_instr *best = NULL;
+      int best_gain = INT_MIN;
+      for (unsigned i = 0; i < count; i++) {
+         nir_instr *instr = by_index[i];
+         if (!instr || done[i] || unready[i])
+            continue;
+         int gain;
+         if (!pressure_cost(instr)) {
+            /* copies, constants and loads take nothing: right away, but
+             * the colour store last */
+            gain = INT_MAX;
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_store_output)
+               gain = INT_MIN + 1;
+         } else {
+            pressure_reads_of(instr, &r);
+            gain = -(int)pressure_cost(instr);
+            for (unsigned k = 0; k < r.n; k++)
+               if (remaining[r.key[k]] == 1)
+                  gain += pressure_unit(by_index[r.key[k] / 4]);
+         }
+         if (gain > best_gain) {
+            best = instr;
+            best_gain = gain;
+         }
+      }
+      if (!best)
+         break;
+      done[best->index] = true;
+      order[n++] = best;
+      pressure_reads_of(best, &r);
+      for (unsigned k = 0; k < r.n; k++)
+         if (remaining[r.key[k]])
+            remaining[r.key[k]]--;
+      nir_def *def = nir_instr_def(best);
+      if (def)
+         nir_foreach_use(u, def)
+            unready[nir_src_parent_instr(u)->index]--;
+   }
+
+   bool ok = n == count;
+   if (ok) {
+      for (unsigned i = 0; i < n; i++) {
+         nir_instr_remove(order[i]);
+         nir_instr_insert(nir_after_block(block), order[i]);
+      }
+   }
+   free(by_index);
+   free(remaining);
+   free(unready);
+   free(done);
+   free(order);
+   nir_progress(ok, impl, nir_metadata_control_flow);
+   return ok;
+}
+
 /*
  * Varyings and gl_FragCoord cost one MFU or ALU op to read again, while a
  * held value costs one of only four registers: give every user its own load.
@@ -1937,30 +2792,52 @@ grate_nir_fs_lower(nir_shader *s)
  *  0. NIR's order;
  *  1. inputs re-loaded per user, then a depth-first order from the output;
  *  2. NIR's order through nir_schedule's register-pressure fallback;
- *  3. 1 then 2.
+ *  3. 1 then 2;
+ *  4. a greedy order that frees registers first (reorder_pressure()).
+ * Then the same orders again, spilling to render targets when registers
+ * run out.
  */
-bool
-grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s, const char **error)
+static bool
+try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
+            int order, bool spill, int max_segments, int cut,
+            const char **error)
 {
    const nir_schedule_options sched = { .threshold = 4, .fallback = true };
-
-   for (int attempt = 0; attempt < 4; attempt++) {
-      nir_shader *v = nir_shader_clone(NULL, s);
-      if (attempt & 1) {
+   nir_shader *v = nir_shader_clone(NULL, s);
+   if (order == 4) {
+      NIR_PASS(_, v, reorder_pressure);
+   } else {
+      if (order & 1) {
          NIR_PASS(_, v, rematerialize_inputs);
          NIR_PASS(_, v, reorder_depth_first);
       }
-      if (attempt & 2)
+      if (order & 2)
          NIR_PASS(_, v, nir_schedule, &sched);
-      const char *err = NULL;
-      bool ok = compile(fp, v, &err);
-      ralloc_free(v);
-      if (ok) {
-         *error = NULL;
-         return true;
-      }
-      if (attempt == 0)
-         *error = err;
    }
+   bool ok = compile(fps, max_segments, cut, 28, num_segments, v, spill, error);
+   ralloc_free(v);
+   return ok;
+}
+
+bool
+grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
+                const char **error)
+{
+   const char *err = NULL;
+
+   /* every order in one pass without spilling first, then with */
+   for (int spill = 0; spill < 2; spill++)
+      for (int order = 0; order < 5; order++)
+         if (try_compile(fps, num_segments, s, order, spill, 1, INT_MAX,
+                         spill || order ? &err : error))
+            return true;
+
+   /* then several passes, shorter ones until it fits */
+   static const int cuts[] = { 56, 48, 40, 32 };
+   for (unsigned i = 0; i < ARRAY_SIZE(cuts); i++)
+      for (int order = 4; order >= 0; order--)
+         if (try_compile(fps, num_segments, s, order, true,
+                         GRATE_FP_MAX_SEGMENTS, cuts[i], &err))
+            return true;
    return false;
 }
