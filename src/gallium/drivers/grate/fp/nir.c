@@ -1294,14 +1294,26 @@ materialize_coords(struct comp *c, nir_tex_instr *tex, int coord)
 static void
 emit_tex(struct comp *c, nir_tex_instr *tex)
 {
-   if (tex->op != nir_texop_tex || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
-       tex->is_array || tex->is_shadow) {
+   /*
+    * External images (imported dma-bufs) sample like 2D textures here, and
+    * an explicit LOD or bias of zero is what a plain lookup does anyway.
+    */
+   int extra = nir_tex_instr_src_index(tex, tex->op == nir_texop_txl ?
+                                       nir_tex_src_lod : nir_tex_src_bias);
+   bool zero_extra = extra >= 0 && nir_src_is_const(tex->src[extra].src) &&
+                     nir_src_as_float(tex->src[extra].src) == 0.0f;
+   bool op_ok = tex->op == nir_texop_tex ||
+                ((tex->op == nir_texop_txl || tex->op == nir_texop_txb) &&
+                 zero_extra);
+   if (!op_ok || tex->is_array || tex->is_shadow ||
+       (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+        tex->sampler_dim != GLSL_SAMPLER_DIM_EXTERNAL)) {
       fail(c, "unsupported texture op");
       return;
    }
 
    int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   if (coord < 0 || tex->num_srcs != 1) {
+   if (coord < 0 || tex->num_srcs != 1 + (tex->op != nir_texop_tex)) {
       fail(c, "unsupported texture sources");
       return;
    }
