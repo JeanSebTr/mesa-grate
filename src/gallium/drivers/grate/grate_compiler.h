@@ -34,7 +34,16 @@ struct grate_fp_info {
    /* what the draw code uploads to uniform register 32 + i (FP_CONST(i)) */
    uint32_t uniforms[96]; /* 32 after compile(), see fp/nir.c */
    int num_uniforms;
+
+   /* register spill slots: render target 4 + i, RGBA8 if bit i of
+    * spill_rgba8 is set, RG fp16 otherwise */
+   int num_spill_slots;
+   uint32_t spill_rgba8;
 };
+
+#define GRATE_FP_MAX_SPILL_SLOTS 8
+/* passes a long fragment program is drawn in, see fp/nir.c */
+#define GRATE_FP_MAX_SEGMENTS 4
 
 #define GRATE_FP_MAX_UNIFORMS 32
 /* uniform table entries: kind in bits 28..31, payload below */
@@ -55,8 +64,8 @@ struct grate_fp_info {
 
 struct nir_shader;
 bool
-grate_nir_to_fp(struct grate_fp_shader *fp, struct nir_shader *s,
-                const char **error);
+grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments,
+                struct nir_shader *s, const char **error);
 void
 grate_nir_fs_lower(struct nir_shader *s);
 

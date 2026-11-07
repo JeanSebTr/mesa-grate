@@ -64,6 +64,10 @@ grate_context_destroy(struct pipe_context *pcontext)
 
    grate_flush_3d(context);
 
+   for (int i = 0; i < GRATE_FP_MAX_SPILL_SLOTS; i++)
+      if (context->spill_bo[i])
+         drm_tegra_bo_unref(context->spill_bo[i]);
+
    if (context->primconvert)
       util_primconvert_destroy(context->primconvert);
 

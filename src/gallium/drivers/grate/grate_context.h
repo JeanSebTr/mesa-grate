@@ -8,6 +8,7 @@
 
 #include "grate_state.h"
 #include "grate_stream.h"
+#include "grate_compiler.h"
 
 struct primconvert_context;
 
@@ -51,11 +52,16 @@ struct grate_context {
    struct grate_vertex_shader_state *vshader;
    struct pipe_blend_state *blend;
    struct grate_fragment_shader_state *fshader;
+   int fs_pass; /* which pass of fshader the next draw emits */
 
    struct pipe_sampler_view *fragment_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    unsigned num_fragment_views;
    struct pipe_sampler_state *fragment_samplers[PIPE_MAX_SAMPLERS];
    unsigned num_fragment_samplers;
+
+   /* register spill surfaces, render target 4 + i (see fp/nir.c) */
+   struct drm_tegra_bo *spill_bo[GRATE_FP_MAX_SPILL_SLOTS];
+   size_t spill_size[GRATE_FP_MAX_SPILL_SLOTS];
 
    uint32_t no_scissor[3];
    struct pipe_scissor_state scissor;
