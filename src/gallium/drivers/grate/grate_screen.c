@@ -6,6 +6,9 @@
 #include <xf86drm.h>
 
 #include "compiler/nir/nir.h"
+#include "util/build_id.h"
+#include "util/disk_cache.h"
+#include "util/mesa-blake3.h"
 #include "util/os_file.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
@@ -37,8 +40,30 @@ grate_screen_destroy(struct pipe_screen *pscreen)
 
    slab_destroy_parent(&screen->transfer_pool);
 
+   disk_cache_destroy(screen->disk_cache);
    drm_tegra_close(screen->drm);
    FREE(screen);
+}
+
+static struct disk_cache *
+grate_screen_get_disk_shader_cache(struct pipe_screen *pscreen)
+{
+   return grate_screen(pscreen)->disk_cache;
+}
+
+/* keyed on this build of the driver, like lima's */
+static void
+grate_disk_cache_init(struct grate_screen *screen)
+{
+   const struct build_id_note *note =
+      build_id_find_nhdr_for_addr(grate_disk_cache_init);
+   if (!note || build_id_length(note) != BUILD_ID_EXPECTED_HASH_LENGTH)
+      return;
+
+   char timestamp[BLAKE3_HEX_LEN];
+   _mesa_sha1_format(timestamp, build_id_data(note));
+   screen->disk_cache = disk_cache_create(screen->base.get_name(&screen->base),
+                                          timestamp, 0);
 }
 
 static const char *
@@ -328,6 +353,7 @@ grate_screen_create(int fd)
    screen->base.is_format_supported = grate_screen_is_format_supported;
    screen->base.query_dmabuf_modifiers = grate_screen_query_dmabuf_modifiers;
    screen->base.is_dmabuf_modifier_supported = grate_screen_is_dmabuf_modifier_supported;
+   screen->base.get_disk_shader_cache = grate_screen_get_disk_shader_cache;
 
    /* fence functions */
    screen->base.fence_reference = grate_screen_fence_reference;
@@ -342,6 +368,8 @@ grate_screen_create(int fd)
    grate_screen_resource_init(&screen->base);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct pipe_transfer), 16);
+
+   grate_disk_cache_init(screen);
 
    return &screen->base;
 }

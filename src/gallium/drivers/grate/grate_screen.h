@@ -18,6 +18,9 @@ struct grate_screen {
    struct slab_parent_pool transfer_pool;
 
    struct drm_tegra *drm;
+
+   /* compiled fragment programs (and Mesa's own shader cache) */
+   struct disk_cache *disk_cache;
 };
 
 static inline struct grate_screen *
