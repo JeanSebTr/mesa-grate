@@ -773,6 +773,57 @@ float_to_fp20(float f)
    return sign << 19 | (uint32_t)e << 13 | (u & 0x7fffff) >> 10;
 }
 
+/* the value of a uniform table entry other than a fx10 pair */
+static float
+fs_uniform_value(struct grate_context *context, const struct grate_fp_info *info,
+                 uint32_t u, int depth)
+{
+   const struct pipe_constant_buffer *cb =
+      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+   const float *data = cb->user_buffer;
+   uint32_t payload = GRATE_FP_UNIFORM_PAYLOAD(u);
+
+   switch (GRATE_FP_UNIFORM_KIND(u)) {
+   case GRATE_FP_UNIFORM_KIND_CB:
+      return data && payload * 4 < cb->buffer_size ? data[payload] : 0.0f;
+   case GRATE_FP_UNIFORM_KIND_IMM:
+      return uif(payload << 4);
+   case GRATE_FP_UNIFORM_KIND_FB_Y:
+      /*
+       * pos.y counts render target rows when the viewport isn't flipped
+       * (FBOs), and from the bottom when it is.
+       */
+      if (context->y_invert)
+         return payload ? 8191.0f + context->framebuffer.base.height : -1.0f;
+      return payload ? -8192.0f : 1.0f;
+   case GRATE_FP_UNIFORM_KIND_EXPR: {
+      if (payload >= (uint32_t)info->num_exprs || depth > 32)
+         return 0.0f;
+      const struct grate_fp_expr *e = &info->exprs[payload];
+      float a = fs_uniform_value(context, info, e->src[0], depth + 1);
+      float b = e->op <= GRATE_FP_EXPR_FMA || e->op == GRATE_FP_EXPR_MIN ||
+                e->op == GRATE_FP_EXPR_MAX ?
+                fs_uniform_value(context, info, e->src[1], depth + 1) : 0.0f;
+      switch (e->op) {
+      case GRATE_FP_EXPR_ADD: return a + b;
+      case GRATE_FP_EXPR_MUL: return a * b;
+      case GRATE_FP_EXPR_FMA:
+         return a * b + fs_uniform_value(context, info, e->src[2], depth + 1);
+      case GRATE_FP_EXPR_NEG: return -a;
+      case GRATE_FP_EXPR_ABS: return fabsf(a);
+      case GRATE_FP_EXPR_SAT: return CLAMP(a, 0.0f, 1.0f);
+      case GRATE_FP_EXPR_MIN: return MIN2(a, b);
+      case GRATE_FP_EXPR_MAX: return MAX2(a, b);
+      case GRATE_FP_EXPR_RCP: return 1.0f / a;
+      case GRATE_FP_EXPR_RSQ: return 1.0f / sqrtf(a);
+      case GRATE_FP_EXPR_SQRT: return sqrtf(a);
+      }
+      return 0.0f;
+   }
+   }
+   return 0.0f;
+}
+
 /* the uniform registers a NIR-compiled fragment program reads, see fp/nir.c */
 static void
 emit_fs_uniforms(struct grate_context *context, const struct grate_fp_info *info)
@@ -789,25 +840,7 @@ emit_fs_uniforms(struct grate_context *context, const struct grate_fp_info *info
    for (int i = 0; i < info->num_uniforms; i++) {
       uint32_t u = info->uniforms[i];
       uint32_t payload = GRATE_FP_UNIFORM_PAYLOAD(u);
-      float f = 0.0f;
       switch (GRATE_FP_UNIFORM_KIND(u)) {
-      case GRATE_FP_UNIFORM_KIND_CB:
-         if (data && payload * 4 < cb->buffer_size)
-            f = data[payload];
-         break;
-      case GRATE_FP_UNIFORM_KIND_IMM:
-         f = uif(payload << 4);
-         break;
-      case GRATE_FP_UNIFORM_KIND_FB_Y:
-         /*
-          * pos.y counts render target rows when the viewport isn't flipped
-          * (FBOs), and from the bottom when it is.
-          */
-         if (context->y_invert)
-            f = payload ? 8191.0f + context->framebuffer.base.height : -1.0f;
-         else
-            f = payload ? -8192.0f : 1.0f;
-         break;
       case GRATE_FP_UNIFORM_KIND_CB_PAIR: {
          /* two fx10 (1/256 steps, [-4, 4)) in the low and high halves */
          uint32_t lohi = 0;
@@ -821,7 +854,7 @@ emit_fs_uniforms(struct grate_context *context, const struct grate_fp_info *info
          continue;
       }
       }
-      regs[i] = float_to_fp20(f);
+      regs[i] = float_to_fp20(fs_uniform_value(context, info, u, 0));
    }
 
    grate_stream_push(stream, host1x_opcode_incr(TGR3D_FP_CONST(0),

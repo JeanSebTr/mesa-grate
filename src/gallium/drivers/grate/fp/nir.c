@@ -131,6 +131,9 @@ struct comp {
    bool ensure_varyings;
    /* row registers R0-R3 some stage of the last batch reads or writes */
    unsigned touched;
+   /* computed uniforms, for every pass (grate_fp_info.exprs) */
+   struct grate_fp_expr exprs[GRATE_FP_MAX_EXPRS];
+   int num_exprs;
 };
 
 static struct val *
@@ -1546,6 +1549,69 @@ half_free(struct comp *c, nir_alu_instr *alu, int reg, bool high)
    return true;
 }
 
+/*
+ * An operation on uniforms and immediates only gives the same value in
+ * every fragment: the draw code computes it once, on the CPU, into a
+ * uniform register (GRATE_FP_UNIFORM_KIND_EXPR), instead of every fragment
+ * spending ALU slots and a row register on it.
+ */
+static uint32_t
+expr_key(struct comp *c, enum grate_fp_expr_op op, uint32_t a, uint32_t b,
+         uint32_t d)
+{
+   for (int i = 0; i < c->num_exprs; i++) {
+      const struct grate_fp_expr *e = &c->exprs[i];
+      if (e->op == op && e->src[0] == a && e->src[1] == b && e->src[2] == d)
+         return GRATE_FP_UNIFORM_EXPR(i);
+   }
+   if (c->num_exprs == GRATE_FP_MAX_EXPRS)
+      return 0;
+   c->exprs[c->num_exprs] = (struct grate_fp_expr) { op, { a, b, d } };
+   return GRATE_FP_UNIFORM_EXPR(c->num_exprs++);
+}
+
+static bool
+fold_uniform(struct comp *c, nir_alu_instr *alu, unsigned ch, struct val *dst)
+{
+   static const struct { nir_op nir; enum grate_fp_expr_op op; } ops[] = {
+      { nir_op_fadd, GRATE_FP_EXPR_ADD },  { nir_op_fmul, GRATE_FP_EXPR_MUL },
+      { nir_op_ffma, GRATE_FP_EXPR_FMA },  { nir_op_fneg, GRATE_FP_EXPR_NEG },
+      { nir_op_fabs, GRATE_FP_EXPR_ABS },  { nir_op_fsat, GRATE_FP_EXPR_SAT },
+      { nir_op_fmin, GRATE_FP_EXPR_MIN },  { nir_op_fmax, GRATE_FP_EXPR_MAX },
+      { nir_op_frcp, GRATE_FP_EXPR_RCP },  { nir_op_frsq, GRATE_FP_EXPR_RSQ },
+      { nir_op_fsqrt, GRATE_FP_EXPR_SQRT },
+   };
+   int k = 0;
+   while (k < (int)ARRAY_SIZE(ops) && ops[k].nir != alu->op)
+      k++;
+   if (k == ARRAY_SIZE(ops) || alu->def.bit_size != 32)
+      return false;
+
+   uint32_t src[3] = { 0 };
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+      bool negate = false, absolute = false;
+      nir_scalar sc = chase(nir_get_scalar(alu->src[i].src.ssa,
+                                           alu->src[i].swizzle[ch]),
+                            &negate, &absolute);
+      const struct val *v = def_val(c, sc.def, sc.comp);
+      if (v->kind != VAL_UNIFORM)
+         return false;
+      src[i] = v->ukey;
+      if (absolute)
+         src[i] = expr_key(c, GRATE_FP_EXPR_ABS, src[i], 0, 0);
+      if (negate && src[i])
+         src[i] = expr_key(c, GRATE_FP_EXPR_NEG, src[i], 0, 0);
+      if (!src[i])
+         return false;
+   }
+   uint32_t key = expr_key(c, ops[k].op, src[0], src[1], src[2]);
+   if (!key)
+      return false;
+   /* a table entry only where an instruction reads it, see operand() */
+   *dst = (struct val) { .kind = VAL_UNIFORM, .index = -1, .ukey = key, .def = -1 };
+   return true;
+}
+
 static void
 emit_alu(struct comp *c, nir_alu_instr *alu)
 {
@@ -1558,6 +1624,8 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
 
    for (unsigned ch = 0; ch < n; ch++) {
       struct val *dst = def_val(c, &alu->def, ch);
+      if (fold_uniform(c, alu, ch, dst))
+         continue;
       bool sfu = alu->op == nir_op_frcp || alu->op == nir_op_frsq ||
                  alu->op == nir_op_fsqrt || alu->op == nir_op_flog2 ||
                  alu->op == nir_op_fexp2 || alu->op == nir_op_ffract;
@@ -2386,6 +2454,8 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
       segment_end(&c);
 
    for (int k = 0; k <= seg; k++) {
+      memcpy(fps[k].info.exprs, c.exprs, sizeof(c.exprs));
+      fps[k].info.num_exprs = c.num_exprs;
       fps[k].info.num_spill_slots = c.num_slots;
       for (int i = 0; i < c.num_slots; i++)
          if (c.slot_rgba8[i])

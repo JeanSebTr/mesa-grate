@@ -20,6 +20,22 @@ struct grate_vp_shader {
    int num_immediates;
 };
 
+/* operations of computed uniforms (grate_fp_info.exprs) */
+enum grate_fp_expr_op {
+   GRATE_FP_EXPR_ADD,
+   GRATE_FP_EXPR_MUL,
+   GRATE_FP_EXPR_FMA,
+   GRATE_FP_EXPR_NEG,
+   GRATE_FP_EXPR_ABS,
+   GRATE_FP_EXPR_SAT,
+   GRATE_FP_EXPR_MIN,
+   GRATE_FP_EXPR_MAX,
+   GRATE_FP_EXPR_RCP,
+   GRATE_FP_EXPR_RSQ,
+   GRATE_FP_EXPR_SQRT,
+};
+#define GRATE_FP_MAX_EXPRS 128
+
 struct grate_fp_info {
    struct {
       uint32_t src;
@@ -34,6 +50,14 @@ struct grate_fp_info {
    /* what the draw code uploads to uniform register 32 + i (FP_CONST(i)) */
    uint32_t uniforms[96]; /* 32 after compile(), see fp/nir.c */
    int num_uniforms;
+
+   /* values computed from other table entries at draw time, see
+    * GRATE_FP_UNIFORM_KIND_EXPR (the same table in every pass) */
+   struct grate_fp_expr {
+      uint32_t op; /* enum grate_fp_expr_op */
+      uint32_t src[3]; /* uniform table keys */
+   } exprs[GRATE_FP_MAX_EXPRS];
+   int num_exprs;
 
    /* register spill slots: render target 4 + i, RGBA8 if bit i of
     * spill_rgba8 is set, RG fp16 otherwise */
@@ -53,12 +77,15 @@ struct grate_fp_info {
 #define GRATE_FP_UNIFORM_KIND_IMM    2 /* float bits >> 4 */
 #define GRATE_FP_UNIFORM_KIND_FB_Y   3 /* gl_FragCoord.y from pos.y: 0 scale, 1 offset */
 #define GRATE_FP_UNIFORM_KIND_CB_PAIR 4 /* two dwords as fx10 low, high */
+#define GRATE_FP_UNIFORM_KIND_EXPR   5 /* computed: node of grate_fp_info.exprs */
 #define GRATE_FP_UNIFORM_CB(dword) \
    ((GRATE_FP_UNIFORM_KIND_CB << 28) | (dword))
 #define GRATE_FP_UNIFORM_IMM(f) \
    ((GRATE_FP_UNIFORM_KIND_IMM << 28) | (fui(f) >> 4))
 #define GRATE_FP_UNIFORM_FB_YSCALE (GRATE_FP_UNIFORM_KIND_FB_Y << 28)
 #define GRATE_FP_UNIFORM_FB_YOFF ((GRATE_FP_UNIFORM_KIND_FB_Y << 28) | 1)
+#define GRATE_FP_UNIFORM_EXPR(node) \
+   ((GRATE_FP_UNIFORM_KIND_EXPR << 28) | (node))
 #define GRATE_FP_UNIFORM_CB_PAIR(lo, hi) \
    ((GRATE_FP_UNIFORM_KIND_CB_PAIR << 28) | (lo) | (hi) << 14)
 
