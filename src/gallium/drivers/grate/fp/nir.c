@@ -181,10 +181,10 @@ chase(nir_scalar s, bool *negate, bool *absolute)
          return s;
       nir_alu_instr *alu = nir_instr_as_alu(i);
       if (alu->op == nir_op_fabs) {
+         /* the negations found so far apply to |x|, those inside don't */
          if (absolute) *absolute = true;
-         if (negate) *negate = false;
       } else if (alu->op == nir_op_fneg) {
-         if (negate) *negate = !*negate;
+         if (negate && !(absolute && *absolute)) *negate = !*negate;
       } else {
          return s;
       }
