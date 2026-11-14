@@ -207,6 +207,7 @@ grate_stream_begin(struct grate_stream *stream)
       return -1;
    }
 
+   stream->start = stream->buffer.pushbuf->ptr;
    stream->class_id = 0;
    stream->status = GRATE_STREAM_CONSTRUCT;
 

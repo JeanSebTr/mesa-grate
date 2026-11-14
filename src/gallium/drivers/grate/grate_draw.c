@@ -449,11 +449,19 @@ grate_draw_vbo(struct pipe_context *pcontext,
             return;
          }
          grate_stream_end(stream);
+         /* passes and triangles of one draw can add up: same limit */
+         if (grate_stream_words(stream) > GRATE_STREAM_FLUSH_WORDS)
+            grate_flush_3d(context);
       }
    }
    context->fs_pass = 0;
 
-   if (++stream->num_draws >= 64)
+   /*
+    * The kernel rejects a command buffer over 16383 words (the CDMA gather
+    * limit), and the whole job's draws with it: submit well before that.
+    */
+   if (++stream->num_draws >= 64 ||
+       grate_stream_words(stream) > GRATE_STREAM_FLUSH_WORDS)
       grate_flush_3d(context);
 }
 
