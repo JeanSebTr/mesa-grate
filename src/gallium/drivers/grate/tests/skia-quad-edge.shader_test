@@ -1,0 +1,50 @@
+# Skia (GL backend) quadratic-edge coverage: interior fast path, and the
+# curve path that divides by the length of a gradient taken with
+# dFdx/dFdy (zero on GR3D, so curved edges come out hard)
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying highp vec4 vQuadEdge_S0;
+varying mediump vec4 vinColor_S0;
+void main()
+{
+	gl_Position = piglit_vertex;
+	/* u = 0.5, v = y, z = x: inside (z > 0) on the right half */
+	vQuadEdge_S0 = vec4(0.5, piglit_vertex.y, piglit_vertex.x, 1.0);
+	vinColor_S0 = vec4(0.0, 1.0, 0.0, 1.0);
+}
+
+[fragment shader]
+#version 100
+#extension GL_OES_standard_derivatives : require
+uniform highp vec2 u_skRTFlip;
+precision mediump float;
+varying highp vec4 vQuadEdge_S0;
+varying mediump vec4 vinColor_S0;
+void main() {
+mediump vec4 outputColor_S0 = vinColor_S0;
+mediump float edgeAlpha;
+mediump vec2 duvdx = dFdx(vQuadEdge_S0.xy);
+mediump vec2 duvdy = (u_skRTFlip.y * dFdy(vQuadEdge_S0.xy));
+if (vQuadEdge_S0.z > 0.0 && vQuadEdge_S0.w > 0.0) {
+edgeAlpha = min(min(vQuadEdge_S0.z, vQuadEdge_S0.w) + 0.5, 1.0);
+} else {
+mediump vec2 gF = vec2((2.0 * vQuadEdge_S0.x) * duvdx.x - duvdx.y, (2.0 * vQuadEdge_S0.x) * duvdy.x - duvdy.y);
+edgeAlpha = vQuadEdge_S0.x * vQuadEdge_S0.x - vQuadEdge_S0.y;
+edgeAlpha = clamp(0.5 - edgeAlpha / max(length(gF), 1e-06), 0.0, 1.0);
+}
+mediump vec4 outputCoverage_S0 = vec4(edgeAlpha);
+gl_FragColor = outputColor_S0 * outputCoverage_S0;
+}
+
+[test]
+uniform vec2 u_skRTFlip 0.0 1.0
+draw rect -1 -1 2 2
+relative probe rgba (0.95, 0.5) (0.0, 1.0, 0.0, 1.0)
+relative probe rgba (0.6, 0.5) (0.0, 0.7, 0.0, 0.7)
+relative probe rgba (0.25, 0.25) (0.0, 0.0, 0.0, 0.0)
+relative probe rgba (0.25, 0.95) (0.0, 1.0, 0.0, 1.0)

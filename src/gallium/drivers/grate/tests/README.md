@@ -23,7 +23,8 @@ doesn't have yet: `shader_runner-blend.patch` adds `enable GL_BLEND` and
 - `texture-sum-*`: texture taps summed, more live values than the four
   row registers: register spilling to render targets.
 - `skia-*`: fragment shaders from Skia's GL backend (antialiased quad,
-  rounded-rect clip, gaussian blur, and the blur with decal edges);
+  rounded-rect clip, gaussian blur, and the blur with decal edges,
+  quadratic-edge coverage with derivatives);
   `skia-aa-quad-vs` uses Skia's vertex shader and attribute layout too.
 
 Avoid running untested programs while a compositor is drawing: a bad
