@@ -40,6 +40,7 @@
  * Registers 24-27 (ALU results) are not used: they aren't per fragment, so
  * reading one gives a neighbouring pixel's value.
  */
+#define REG_ALU_RESULT 24
 #define REG_EMBEDDED 28
 #define REG_UNIFORM 32
 #define REG_POS_X 72
@@ -105,6 +106,10 @@ struct comp {
    uint32_t pkt_rows_written;
    uint32_t pkt_halves_written;
    struct fp_alu_src_operand pkt_slot_row[4];
+   /* the packet before the open one in the same batch, if any: its slot
+    * results are readable as ALU result registers 24 + slot */
+   struct fp_alu_src_operand prev_slot_row[4];
+   int prev_slots;
 
    /* TRAM row of each input, and the components used in each row */
    int input_row[16];
@@ -131,6 +136,8 @@ struct comp {
    bool ensure_varyings;
    /* row registers R0-R3 some stage of the last batch reads or writes */
    unsigned touched;
+   /* read results of the previous ALU packet of a batch (chaining) */
+   bool allow_chain;
    /* computed uniforms, for every pass (grate_fp_info.exprs) */
    struct grate_fp_expr exprs[GRATE_FP_MAX_EXPRS];
    int num_exprs;
@@ -1341,6 +1348,23 @@ dst_of(const struct val *v, bool sat)
    };
 }
 
+/* the slot (of n) whose destination is the register (half) src reads */
+static int
+written_by(const struct fp_alu_src_operand *rows, int n,
+           const struct fp_alu_src_operand *src)
+{
+   for (int k = n - 1; k >= 0; k--) {
+      if (rows[k].index != src->index)
+         continue;
+      if (rows[k].datatype == FP_DATATYPE_FP20 ||
+          (src->datatype == FP_DATATYPE_FIXED10 &&
+           rows[k].sub_reg_select_high == src->sub_reg_select_high))
+         return k;
+      return -1;
+   }
+   return -1;
+}
+
 /* dst = a * b + c, one batch */
 static void
 emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
@@ -1350,35 +1374,53 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    struct fp_alu_src_operand *srcs[3] = { &a, &b, &cc };
 
    /*
-    * Join the open packet unless it's full or this reads a row register
-    * one of its slots writes (the new value only shows next batch).
+    * A row register written in this batch only shows in the next one, but
+    * the packets of a batch run in order, and a slot result of a packet is
+    * readable from the next packet as ALU result register 24 + slot (this
+    * pixel's value, exactly). Find, for each source written in this
+    * batch, the slot of the open packet (chain: needs a new packet) or of
+    * the one before it (read: can join the open packet) that wrote it.
     */
-   bool join = c->pkt && c->pkt_slots < 4;
+   int from_open[3] = { -1, -1, -1 }, from_prev[3] = { -1, -1, -1 };
+   bool stale = false, chain = false;
+   bool nochain = !c->allow_chain;
+   for (int i = 0; i < 3; i++) {
+      if (c->store_packet || srcs[i]->index >= 16 ||
+          !(c->pkt_rows_written & (1u << srcs[i]->index)))
+         continue;
+      from_open[i] = c->pkt && !nochain ? written_by(c->pkt_slot_row, c->pkt_slots, srcs[i]) : -1;
+      from_prev[i] = nochain ? -1 : written_by(c->prev_slot_row, c->prev_slots, srcs[i]);
+      if (from_open[i] >= 0)
+         chain = true;
+      else if (from_prev[i] < 0)
+         stale = true;
+   }
+
    /* two slots writing the same half of a register: keep them apart */
    uint32_t halves = 0;
    if (dst->index < 16)
       halves = ((!dst->fx10 || !dst->high) ? 1u : 0) << (2 * dst->index) |
                ((!dst->fx10 || dst->high) ? 2u : 0) << (2 * dst->index);
    if (c->pkt_halves_written & halves)
-      join = false;
-   for (int i = 0; i < 3 && join; i++)
-      if (!c->store_packet && srcs[i]->index < 16 &&
-          (c->pkt_rows_written & (1u << srcs[i]->index)))
-         join = false;
+      stale = true;
 
-   /* a full packet: another one in the same batch (up to three) */
-   bool conflict = c->pkt_halves_written & halves;
-   for (int i = 0; i < 3; i++)
-      conflict |= !c->store_packet && srcs[i]->index < 16 &&
-                  (c->pkt_rows_written & (1u << srcs[i]->index));
-   if (!join && c->pkt && !conflict && c->pkt_slots == 4 &&
-       c->cur->alu_sched.num_instructions < 3) {
+   bool join = c->pkt && c->pkt_slots < 4 && !stale && !chain;
+   /* a full packet, or results of the open one needed: another packet in
+    * the same batch (up to three) */
+   bool next_pkt = !join && c->pkt && !stale &&
+                   (chain || c->pkt_slots == 4) &&
+                   c->cur->alu_sched.num_instructions < 3;
+   if (next_pkt) {
       struct fp_alu_instr_packet *p = CALLOC_STRUCT(fp_alu_instr_packet);
       list_inithead(&p->link);
       for (int i = 0; i < 4; i++)
          p->slots[i] = alu_nop();
       list_addtail(&p->link, &c->fp->alu_instructions);
       c->cur->alu_sched.num_instructions++;
+      memcpy(c->prev_slot_row, c->pkt_slot_row, sizeof(c->prev_slot_row));
+      c->prev_slots = c->pkt_slots;
+      for (int i = 0; i < 3; i++)
+         from_prev[i] = from_open[i] >= 0 ? from_open[i] : from_prev[i];
       c->pkt = p;
       c->pkt_slots = 0;
       join = true;
@@ -1395,8 +1437,20 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
       inst->alu_sched.num_instructions = 1;
       c->pkt = p;
       c->pkt_slots = 0;
+      c->prev_slots = 0;
       c->pkt_rows_written = 0;
       c->pkt_halves_written = 0;
+      for (int i = 0; i < 3; i++)
+         from_prev[i] = -1;
+   }
+
+   /* sources from the previous packet: its ALU result registers */
+   for (int i = 0; i < 3; i++) {
+      if (from_prev[i] < 0)
+         continue;
+      srcs[i]->index = REG_ALU_RESULT + from_prev[i];
+      srcs[i]->datatype = FP_DATATYPE_FP20;
+      srcs[i]->sub_reg_select_high = false;
    }
 
    int k = c->pkt_slots++;
@@ -1413,17 +1467,21 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    slot->src[2] = cc;
    slot->src[3] = lowp(true);
 
+   /* what the next packet can read as ALU result register 24 + k: not a
+    * saturated result (the register may hold it unclamped) */
+   c->pkt_slot_row[k] = (struct fp_alu_src_operand) { .index = 255 };
    if (dst->index < 16) {
       c->pkt_rows_written |= 1u << dst->index;
       c->pkt_halves_written |= halves;
       dst->pkt = c->pkt;
       dst->slot = k;
       dst->def = c->num_batches - 1;
-      c->pkt_slot_row[k] = (struct fp_alu_src_operand) {
-         .index = dst->index,
-         .datatype = dst->fx10 ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20,
-         .sub_reg_select_high = dst->high,
-      };
+      if (!sat)
+         c->pkt_slot_row[k] = (struct fp_alu_src_operand) {
+            .index = dst->index,
+            .datatype = dst->fx10 ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20,
+            .sub_reg_select_high = dst->high,
+         };
    }
 }
 
@@ -2363,9 +2421,10 @@ fp_clear(struct grate_fp_shader *fp)
  */
 static bool
 compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
-        int *num_segments, nir_shader *s, bool allow_spill, const char **error)
+        int *num_segments, nir_shader *s, bool allow_spill, bool allow_chain,
+        const char **error)
 {
-   struct comp c = { .nir = s };
+   struct comp c = { .nir = s, .allow_chain = allow_chain };
    struct grate_fp_shader *fp = &fps[0];
    int seg = 0;
 
@@ -2903,7 +2962,7 @@ grate_nir_fs_lower(nir_shader *s)
  */
 static bool
 try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
-            int order, bool spill, int max_segments, int cut,
+            int order, bool spill, bool chain, int max_segments, int cut,
             const char **error)
 {
    const nir_schedule_options sched = { .threshold = 4, .fallback = true };
@@ -2918,7 +2977,8 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
       if (order & 2)
          NIR_PASS(_, v, nir_schedule, &sched);
    }
-   bool ok = compile(fps, max_segments, cut, 28, num_segments, v, spill, error);
+   bool ok = compile(fps, max_segments, cut, 28, num_segments, v, spill, chain,
+                     error);
    ralloc_free(v);
    return ok;
 }
@@ -2929,19 +2989,24 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
 {
    const char *err = NULL;
 
-   /* every order in one pass without spilling first, then with */
-   for (int spill = 0; spill < 2; spill++)
-      for (int order = 0; order < 5; order++)
-         if (try_compile(fps, num_segments, s, order, spill, 1, INT_MAX,
-                         spill || order ? &err : error))
-            return true;
-
-   /* then several passes, shorter ones until it fits */
+   /*
+    * Every order in one pass without spilling first, then with; then
+    * several passes, shorter ones until it fits. All with chaining first
+    * (fewer batches), then without (it changes when registers free up,
+    * which can tip a tight shader over).
+    */
    static const int cuts[] = { 56, 48, 40, 32 };
-   for (unsigned i = 0; i < ARRAY_SIZE(cuts); i++)
-      for (int order = 4; order >= 0; order--)
-         if (try_compile(fps, num_segments, s, order, true,
-                         GRATE_FP_MAX_SEGMENTS, cuts[i], &err))
-            return true;
+   for (int chain = 1; chain >= 0; chain--) {
+      for (int spill = 0; spill < 2; spill++)
+         for (int order = 0; order < 5; order++)
+            if (try_compile(fps, num_segments, s, order, spill, chain, 1,
+                            INT_MAX, chain && !spill && !order ? error : &err))
+               return true;
+      for (unsigned i = 0; i < ARRAY_SIZE(cuts); i++)
+         for (int order = 4; order >= 0; order--)
+            if (try_compile(fps, num_segments, s, order, true, chain,
+                            GRATE_FP_MAX_SEGMENTS, cuts[i], &err))
+               return true;
+   }
    return false;
 }
