@@ -2764,7 +2764,6 @@ grate_nir_fs_lower(nir_shader *s)
             type_size_vec4, (nir_lower_io_options)0);
    NIR_PASS(_, s, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
    NIR_PASS(_, s, nir_lower_alu_to_scalar, NULL, NULL);
-   NIR_PASS(_, s, nir_lower_bool_to_float, false);
    do {
       progress = false;
       NIR_PASS(progress, s, nir_opt_loop_unroll);
@@ -2776,6 +2775,9 @@ grate_nir_fs_lower(nir_shader *s)
       NIR_PASS(progress, s, nir_opt_constant_folding);
       NIR_PASS(progress, s, nir_opt_dead_cf);
    } while (progress);
+   /* after flattening the ifs: their conditions become selects too */
+   NIR_PASS(_, s, nir_lower_bool_to_float, false);
+   NIR_PASS(_, s, nir_opt_algebraic);
    /* a * b + c is one ALU slot (MAD) */
    NIR_PASS(_, s, nir_opt_algebraic_late);
    NIR_PASS(_, s, nir_opt_copy_prop);
