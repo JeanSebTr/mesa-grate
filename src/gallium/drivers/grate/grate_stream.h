@@ -52,6 +52,8 @@ struct grate_stream {
 
    struct grate_command_buffer buffer;
    int num_words;
+   /* where the pending job's command words start (one buffer per job) */
+   uint32_t *start;
    uint32_t class_id;
 
    /* BOs relocated by the pending job, referenced until it is submitted */
@@ -83,8 +85,16 @@ grate_stream_begin(struct grate_stream *stream);
 int
 grate_stream_continue(struct grate_stream *stream);
 
-int
-grate_stream_continue(struct grate_stream *stream);
+/* submit the pending job past this many command words (kernel max: 16383
+ * per command buffer, and one draw can add a few thousand) */
+#define GRATE_STREAM_FLUSH_WORDS 12000
+
+/* command words in the job being built */
+static inline unsigned
+grate_stream_words(const struct grate_stream *stream)
+{
+   return stream->job ? stream->buffer.pushbuf->ptr - stream->start : 0;
+}
 
 int
 grate_stream_end(struct grate_stream *stream);
