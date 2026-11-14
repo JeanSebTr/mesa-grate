@@ -7,6 +7,9 @@
 #include "nir/nir_to_tgsi.h"
 #include "nir/tgsi_to_nir.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_serialize.h"
+#include "util/blob.h"
+#include "util/disk_cache.h"
 #include "util/u_debug.h"
 #include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_parse.h"
@@ -179,17 +182,118 @@ static void
 grate_fs_build_blob(struct grate_context *context, struct grate_fp_shader *fpp,
                     struct grate_shader_blob *blob);
 
+/*
+ * The on-disk cache holds what a compile produces for one blend mode: the
+ * passes' command streams and linking info, and whether the shader was
+ * supported. Keyed on the NIR, the blend mode and the chip; the cache
+ * itself is per driver build (see grate_screen.c).
+ */
+#define GRATE_FS_CACHE_VERSION 1
+
+static void
+grate_fs_cache_key(struct grate_context *context,
+                   struct grate_fragment_shader_state *fs,
+                   enum grate_blend_mode mode, cache_key key)
+{
+   struct disk_cache *cache = grate_screen(context->base.screen)->disk_cache;
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, GRATE_FS_CACHE_VERSION);
+   blob_write_uint32(&b, mode);
+   blob_write_uint32(&b, context->tegra114);
+   nir_serialize(&b, fs->nir, true);
+   disk_cache_compute_key(cache, b.data, b.size, key);
+   blob_finish(&b);
+}
+
+static bool
+grate_fs_cache_load(struct grate_context *context,
+                    struct grate_fragment_shader_state *fs,
+                    enum grate_blend_mode mode, const cache_key key)
+{
+   struct disk_cache *cache = grate_screen(context->base.screen)->disk_cache;
+   size_t size;
+   void *data = disk_cache_get(cache, key, &size);
+   if (!data)
+      return false;
+
+   struct blob_reader r;
+   blob_reader_init(&r, data, size);
+   int num_segments = blob_read_uint32(&r);
+   bool supported = blob_read_uint32(&r);
+   struct grate_shader_blob blobs[GRATE_FP_MAX_SEGMENTS] = { 0 };
+   struct grate_fp_info info[GRATE_FP_MAX_SEGMENTS];
+   bool ok = num_segments >= 1 && num_segments <= GRATE_FP_MAX_SEGMENTS;
+   for (int i = 0; ok && i < num_segments; i++) {
+      blobs[i].num_commands = blob_read_uint32(&r);
+      blobs[i].commands = MALLOC(blobs[i].num_commands * sizeof(uint32_t));
+      blob_copy_bytes(&r, blobs[i].commands,
+                      blobs[i].num_commands * sizeof(uint32_t));
+      blob_copy_bytes(&r, &info[i], sizeof(info[i]));
+   }
+   ok &= !r.overrun;
+   free(data);
+
+   if (!ok) {
+      for (int i = 0; i < GRATE_FP_MAX_SEGMENTS; i++)
+         FREE(blobs[i].commands);
+      return false;
+   }
+   if (!supported && mode == GRATE_BLEND_NONE)
+      fprintf(stderr, "grate: fragment shader not supported (cached)\n");
+   for (int i = 0; i < num_segments; i++) {
+      fs->variants[mode][i] = blobs[i];
+      if (mode == GRATE_BLEND_NONE)
+         fs->info[i] = info[i];
+   }
+   if (mode == GRATE_BLEND_NONE)
+      fs->num_segments = num_segments;
+   return true;
+}
+
+static void
+grate_fs_cache_store(struct grate_context *context,
+                     struct grate_fragment_shader_state *fs,
+                     enum grate_blend_mode mode, const cache_key key,
+                     int num_segments, const struct grate_fp_info *info,
+                     bool supported)
+{
+   struct disk_cache *cache = grate_screen(context->base.screen)->disk_cache;
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, num_segments);
+   blob_write_uint32(&b, supported);
+   for (int i = 0; i < num_segments; i++) {
+      const struct grate_shader_blob *sb = &fs->variants[mode][i];
+      blob_write_uint32(&b, sb->num_commands);
+      blob_write_bytes(&b, sb->commands, sb->num_commands * sizeof(uint32_t));
+      blob_write_bytes(&b, &info[i], sizeof(info[i]));
+   }
+   if (!b.out_of_memory)
+      disk_cache_put(cache, key, b.data, b.size, NULL);
+   blob_finish(&b);
+}
+
 static bool
 grate_fs_compile(struct grate_context *context,
                  struct grate_fragment_shader_state *fs,
                  enum grate_blend_mode mode)
 {
+   struct disk_cache *cache = grate_screen(context->base.screen)->disk_cache;
    struct grate_fp_shader fps[GRATE_FP_MAX_SEGMENTS];
+   struct grate_fp_info info[GRATE_FP_MAX_SEGMENTS];
    int num_segments = 1;
+   cache_key key;
+
+   if (cache) {
+      grate_fs_cache_key(context, fs, mode, key);
+      if (grate_fs_cache_load(context, fs, mode, key))
+         return true;
+   }
 
    const char *error = NULL;
-
-   if (!grate_nir_to_fp(fps, &num_segments, fs->nir, &error)) {
+   bool supported = grate_nir_to_fp(fps, &num_segments, fs->nir, &error);
+   if (!supported) {
       /* drawn as nothing, see fp/nir.c */
       fprintf(stderr, "grate: fragment shader not supported: %s\n", error);
       if (grate_debug & GRATE_DEBUG_FS)
@@ -199,12 +303,17 @@ grate_fs_compile(struct grate_context *context,
    grate_fp_append_blend(&fps[num_segments - 1], mode);
 
    for (int i = 0; i < num_segments; i++) {
+      info[i] = fps[i].info;
       grate_fs_build_blob(context, &fps[i], &fs->variants[mode][i]);
       if (mode == GRATE_BLEND_NONE)
-         fs->info[i] = fps[i].info;
+         fs->info[i] = info[i];
    }
    if (mode == GRATE_BLEND_NONE)
       fs->num_segments = num_segments;
+
+   if (cache)
+      grate_fs_cache_store(context, fs, mode, key, num_segments, info,
+                           supported);
    return true;
 }
 
