@@ -2750,6 +2750,33 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/*
+ * GR3D has no derivatives: the shader units can't see neighbouring pixels
+ * (an ALU result register read in the same packet holds some other pixel
+ * of the row, not a neighbour). Screen-space derivatives evaluate to zero:
+ * antialiasing that scales by them, like Skia's curved edges, turns into a
+ * hard edge instead of dropping the whole shader.
+ */
+static bool
+zero_derivatives_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddx_coarse:
+   case nir_intrinsic_ddy_coarse:
+      break;
+   default:
+      return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components,
+                                            intr->def.bit_size));
+   return true;
+}
+
 /* scalar, boolean-free, branch-free SSA for grate_nir_to_fp() */
 void
 grate_nir_fs_lower(nir_shader *s)
@@ -2763,6 +2790,8 @@ grate_nir_fs_lower(nir_shader *s)
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, (nir_lower_io_options)0);
    NIR_PASS(_, s, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+   NIR_PASS(_, s, nir_shader_intrinsics_pass, zero_derivatives_instr,
+            nir_metadata_control_flow, NULL);
    NIR_PASS(_, s, nir_lower_alu_to_scalar, NULL, NULL);
    do {
       progress = false;
@@ -2775,8 +2804,11 @@ grate_nir_fs_lower(nir_shader *s)
       NIR_PASS(progress, s, nir_opt_constant_folding);
       NIR_PASS(progress, s, nir_opt_dead_cf);
    } while (progress);
-   /* after flattening the ifs: their conditions become selects too */
-   NIR_PASS(_, s, nir_lower_bool_to_float, false);
+   /*
+    * After flattening the ifs, their conditions become selects too. Keep
+    * them selects (CSEL): as flrp, a + c * (b - a) loses b when a is large.
+    */
+   NIR_PASS(_, s, nir_lower_bool_to_float, true);
    NIR_PASS(_, s, nir_opt_algebraic);
    /* a * b + c is one ALU slot (MAD) */
    NIR_PASS(_, s, nir_opt_algebraic_late);
