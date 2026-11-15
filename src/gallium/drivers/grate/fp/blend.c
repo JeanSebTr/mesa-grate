@@ -35,6 +35,28 @@ fp_alu_src_fx10(int reg, bool high)
  * Colors are four fx10 in a register pair, B, G, R, A:
  * pair.l, pair.h, (pair + 1).l, (pair + 1).h
  */
+/* a batch that only runs an ALU NOP packet */
+static void
+append_nop_batch(struct grate_fp_shader *fp)
+{
+   struct fp_alu_instr_packet *p = CALLOC_STRUCT(fp_alu_instr_packet);
+   list_inithead(&p->link);
+   for (int i = 0; i < 4; i++)
+      p->slots[i] = (struct fp_alu_instr) {
+         .op = FP_ALU_OP_MAD,
+         .dst = { .index = 31, .write_low_sub_reg = true, .write_high_sub_reg = true },
+         .src = { fp_alu_src_one(), fp_alu_src_fx10(31, false),
+                  fp_alu_src_fx10(31, false), fp_alu_src_one() },
+      };
+   struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
+   list_inithead(&inst->link);
+   inst->mfu_sched.address = list_length(&fp->mfu_instructions);
+   inst->alu_sched.address = list_length(&fp->alu_instructions);
+   inst->alu_sched.num_instructions = 1;
+   list_addtail(&p->link, &fp->alu_instructions);
+   list_addtail(&inst->link, &fp->fp_instructions);
+}
+
 void
 grate_fp_append_blend(struct grate_fp_shader *fp, enum grate_blend_mode mode)
 {
@@ -120,8 +142,19 @@ grate_fp_append_blend(struct grate_fp_shader *fp, enum grate_blend_mode mode)
    inst2->dw = store->dw;
    store->dw.enable = false;
 
+   /*
+    * With several ALU buffer rows, the PSEQ and DW stages must run on row
+    * 0 (batches 0 mod rows), registers written in a batch only show from
+    * the next batch on row 0, and the batch count must stay a multiple of
+    * the rows: ALU-only NOP batches in between and after.
+    */
+   int rows = fp->alu_buf_size;
    list_addtail(&inst->link, &fp->fp_instructions);
+   for (int k = 1; k < rows; k++)
+      append_nop_batch(fp);
    list_addtail(&inst2->link, &fp->fp_instructions);
+   for (int k = 1; k < rows; k++)
+      append_nop_batch(fp);
 }
 
 
