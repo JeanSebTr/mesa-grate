@@ -2,9 +2,9 @@
 
 piglit `shader_runner` tests (GLES 2), each drawing one quad and probing
 pixels. They pass on llvmpipe; on GR3D all but two pass: `skia-blur`
-(drawn in three passes) is one tap off at a probe that sits exactly on a
-texel edge (coordinates go through fp16 spill slots), and
-`skia-blur-decal` doesn't compile yet (it runs out of spill slots).
+and `skia-blur-decal` (drawn in several passes) are one tap off at a
+probe that sits exactly on a texel edge (coordinates go through fp16
+spill slots).
 
 Run on the device with a GLES 2 build of piglit on surfaceless EGL:
 

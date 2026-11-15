@@ -67,7 +67,7 @@ struct grate_fp_info {
 
 #define GRATE_FP_MAX_SPILL_SLOTS 8
 /* passes a long fragment program is drawn in, see fp/nir.c */
-#define GRATE_FP_MAX_SEGMENTS 4
+#define GRATE_FP_MAX_SEGMENTS 12
 
 #define GRATE_FP_MAX_UNIFORMS 32
 /* uniform table entries: kind in bits 28..31, payload below */
