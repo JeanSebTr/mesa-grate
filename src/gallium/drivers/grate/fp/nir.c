@@ -862,12 +862,15 @@ compact_pair(struct comp *c)
          bool f;
          int64_t sq = reg_score(c, q + h, &f), so = reg_score(c, o + h, &f);
          if (sq < 0) {
-            /* protected (or reserved): only a protected fp20 value moves */
+            /*
+             * protected (or reserved): a protected value moves, an fx10
+             * one into the same half (with its other half, if live)
+             */
             bool movable = false;
             for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
                struct val *v = &c->vals[i];
                if (v->kind == VAL_ROW && v->index == q + h)
-                  movable = !v->fx10;
+                  movable = true;
             }
             ok &= movable;
             need++;
