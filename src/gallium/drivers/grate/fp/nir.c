@@ -139,16 +139,17 @@ struct comp {
    /* read results of the previous ALU packet of a batch (chaining) */
    bool allow_chain;
    /*
-    * ALU buffer rows (1 or 2): with two, r4-r7 are registers too, but the
-    * MFU, TEX, PSEQ and DW stages of batch k work on row k % 2: they only
-    * go in even batches here (row 0, r0-r3, as with one row).
+    * ALU buffer rows (1, 2 or 4): with n, r4-r(4n-1) are registers too,
+    * but the MFU, TEX, PSEQ and DW stages of batch k work on row k % n:
+    * they only go in batches 0 mod n here (row 0, r0-r3, as with one row).
     */
    int rows;
    /* row registers some stage writes in the current batch, and those the
-    * last even batch wrote: with two rows, an odd batch doesn't see them
-    * (register writes only show from the next even batch) */
+    * batch before wrote if it isn't the last of a round of n: the batch
+    * right after it doesn't see them yet (only the one after that, or
+    * the first batch of the next round) */
    unsigned written;
-   unsigned even_written;
+   unsigned prev_written;
    /* computed uniforms, for every pass (grate_fp_info.exprs) */
    struct grate_fp_expr exprs[GRATE_FP_MAX_EXPRS];
    int num_exprs;
@@ -366,8 +367,8 @@ new_batch(struct comp *c)
    c->cur = inst;
    c->cur_ipl = NULL;
    c->touched = 0;
-   /* entering an odd batch: the even one before hides its writes */
-   c->even_written = c->rows > 1 && (c->num_batches - 1) % 2 ? c->written : 0;
+   /* inside a round of rows batches, the batch before hides its writes */
+   c->prev_written = (c->num_batches - 1) % c->rows ? c->written : 0;
    c->written = 0;
    return inst;
 }
@@ -699,6 +700,50 @@ reg_score(struct comp *c, int r, bool *fx10)
 }
 
 /*
+ * A batch sees what an earlier one wrote from two batches on, or from the
+ * next one when that starts a round of rows batches. The DW of the last
+ * batch of a round also sees what its own ALU writes; in the others it
+ * doesn't (a 4-row blur loses a tap).
+ */
+static bool
+seen_in(struct comp *c, int def, int bi)
+{
+   return (bi == def && bi % c->rows == c->rows - 1) || bi >= def + 2 ||
+          (bi == def + 1 && def % c->rows == c->rows - 1);
+}
+
+/* batch bi can DW the values in registers lo and/or lo + 1 (mask) */
+static bool
+pair_visible(struct comp *c, int lo, unsigned mask, int bi)
+{
+   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      struct val *v = &c->vals[i];
+      if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1 &&
+          (mask & (1u << (v->index - lo))) &&
+          (bi < v->def || !seen_in(c, v->def, bi)))
+         return false;
+   }
+   return true;
+}
+
+/* the current batch or a new one on the row of registers lo, lo + 1 that
+ * sees what's in them */
+static struct fp_instr *
+dw_batch(struct comp *c, int lo, unsigned mask)
+{
+   int row = lo / 4;
+   struct fp_instr *b = c->cur;
+   if (b && !b->dw.enable && (c->num_batches - 1) % c->rows == row &&
+       pair_visible(c, lo, mask, c->num_batches - 1))
+      return b;
+   do {
+      b = new_batch(c);
+   } while ((c->num_batches - 1) % c->rows != row ||
+            !pair_visible(c, lo, mask, c->num_batches - 1));
+   return b;
+}
+
+/*
  * Spill registers lo and/or lo + 1 (mask bits 0, 1): varyings are dropped,
  * values with a slot copy too, the rest DW'd into a slot (one DW if both
  * registers hold the same kind). The registers are free from the next batch.
@@ -749,29 +794,25 @@ spill_regs(struct comp *c, int lo, unsigned mask)
        */
       /* and not before the slot's earlier contents were read back */
       int first = c->slot_last[slot];
-      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
-         struct val *v = &c->vals[i];
-         if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1 &&
-             (mask & (1u << (v->index - lo))))
-            first = MAX2(first, v->def);
-      }
+      /* the DW of batch k stores a pair of row k % rows */
+      int row = lo / 4;
       struct fp_instr *b = NULL;
       int bi = 0;
       list_for_each_entry(struct fp_instr, it, &c->fp->fp_instructions, link) {
          if (bi >= first && bi < c->num_batches - 1 && !it->dw.enable &&
-             bi % c->rows == 0)
+             bi % c->rows == row && pair_visible(c, lo, mask, bi))
             b = it;
          bi++;
       }
       if (!b) {
-         b = batch_for(c, 4);
+         b = dw_batch(c, lo, mask);
          c->touched |= 3u << lo;
          /* later ALU ops write the freed registers: not in this batch */
          c->pkt = NULL;
       }
       b->dw.enable = true;
       b->dw.index = SPILL_RT_FIRST + slot;
-      b->dw.src_regs = lo ? FP_DW_REGS_R2_R3 : FP_DW_REGS_R0_R1;
+      b->dw.src_regs = lo % 4 ? FP_DW_REGS_R2_R3 : FP_DW_REGS_R0_R1;
       {
          int idx = 0;
          list_for_each_entry(struct fp_instr, it, &c->fp->fp_instructions, link) {
@@ -812,7 +853,7 @@ spill_any(struct comp *c)
 {
    int best = -1;
    int64_t best_score = -1;
-   for (int r = 0; r < 4; r++) {
+   for (int r = 0; r < 4 * c->rows; r++) {
       bool fx10;
       int64_t sc = reg_score(c, r, &fx10);
       if (sc != SCORE_FREE && sc > best_score) {
@@ -1434,11 +1475,11 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    int from_open[3] = { -1, -1, -1 }, from_prev[3] = { -1, -1, -1 };
    bool stale = false, chain = false;
    /*
-    * With two rows, chaining only in odd batches: in even ones it breaks
-    * Skia's gradient (in the simulator), not understood yet.
+    * With several rows, no chaining in batches 0 mod rows: on the hardware
+    * it reads other values there (a 4-row blur loses taps).
     */
    bool nochain = !c->allow_chain ||
-                  (c->rows > 1 && c->cur && (c->num_batches - 1) % 2 == 0);
+                  (c->rows > 1 && c->cur && (c->num_batches - 1) % c->rows == 0);
    for (int i = 0; i < 3; i++) {
       if (c->store_packet || srcs[i]->index >= 16 ||
           !(c->pkt_rows_written & (1u << srcs[i]->index)))
@@ -1451,12 +1492,11 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
          stale = true;
    }
 
-   /* with two rows, an odd batch reads registers as the even one before
-    * found them */
+   /* inside a round, a batch reads registers as the one before found them */
    bool hidden = false;
-   if (c->rows > 1 && c->cur && (c->num_batches - 1) % 2)
+   if (c->cur)
       for (int i = 0; i < 3; i++)
-         if (srcs[i]->index < 16 && (c->even_written & (1u << srcs[i]->index)) &&
+         if (srcs[i]->index < 16 && (c->prev_written & (1u << srcs[i]->index)) &&
              from_prev[i] < 0 && from_open[i] < 0)
             hidden = stale = true;
 
@@ -1471,7 +1511,12 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    bool join = c->pkt && c->pkt_slots < 4 && !stale && !chain;
    /* a full packet, or results of the open one needed: another packet in
     * the same batch (up to three) */
-   bool next_pkt = !join && c->pkt && !stale &&
+   /* in a new packet, the open one becomes the one before: results of
+    * the one before it are out of reach */
+   bool from_older = false;
+   for (int i = 0; i < 3; i++)
+      from_older |= from_prev[i] >= 0 && from_open[i] < 0;
+   bool next_pkt = !join && c->pkt && !stale && !from_older &&
                    (chain || c->pkt_slots == 4) &&
                    c->cur->alu_sched.num_instructions < 3;
    if (next_pkt) {
@@ -1493,9 +1538,9 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    if (!join) {
       struct grate_fp_shader *fp = c->fp;
       struct fp_instr *inst = hidden ? new_batch(c) : batch_for(c, 3);
-      /* a fresh odd batch still hides what the even one before wrote */
-      for (int i = 0; i < 3 && c->rows > 1 && (c->num_batches - 1) % 2; i++)
-         if (srcs[i]->index < 16 && (c->even_written & (1u << srcs[i]->index)))
+      /* a fresh batch still hides what the one before wrote */
+      for (int i = 0; i < 3; i++)
+         if (srcs[i]->index < 16 && (c->prev_written & (1u << srcs[i]->index)))
             inst = new_batch(c);
       struct fp_alu_instr_packet *p = CALLOC_STRUCT(fp_alu_instr_packet);
       list_inithead(&p->link);
@@ -2467,36 +2512,15 @@ static void
 spill_all(struct comp *c)
 {
    c->nprotect = 0;
-   for (;;) {
-      for (int lo = 0; lo <= 2 && !c->error; lo += 2) {
-         unsigned mask = 0;
-         for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
-            struct val *v = &c->vals[i];
-            if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1)
-               mask |= 1u << (v->index - lo);
-         }
-         if (mask)
-            spill_regs(c, lo, mask);
-      }
-      /* values in the second row: through R0-R3 (DW stores from there) */
-      int moved = 0;
-      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS &&
-                       moved < 4 && !c->error; i++) {
+   for (int lo = 0; lo < 4 * c->rows && !c->error; lo += 2) {
+      unsigned mask = 0;
+      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
          struct val *v = &c->vals[i];
-         if (v->kind != VAL_ROW || v->index < 4)
-            continue;
-         struct val to = { .kind = VAL_ROW, .index = alloc_reg(c, 0, 3),
-                           .def = c->num_batches };
-         emit_mad(c, &to, FP_ALU_OP_MAD, operand(c, v), lowp(true),
-                  lowp(false), false);
-         c->reg_busy_until[v->index] = MIN2(c->reg_busy_until[v->index],
-                                           c->num_batches);
-         to.last = c->num_batches;
-         *v = to;
-         moved++;
+         if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1)
+            mask |= 1u << (v->index - lo);
       }
-      if (!moved || c->error)
-         break;
+      if (mask)
+         spill_regs(c, lo, mask);
    }
 }
 
@@ -3176,10 +3200,10 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    /*
     * One row without spilling first: every order. Then, with spilling,
     * every order in one pass and then several passes, shorter ones until
-    * it fits, with one row and with two (eight registers, but padding
-    * batches): the one with fewer batches wins. All with chaining first
-    * (fewer batches), then without (it changes when registers free up,
-    * which can tip a tight shader over).
+    * it fits, with one, two and four rows (eight or sixteen registers,
+    * but padding batches): the one with fewer batches wins. All with
+    * chaining first (fewer batches), then without (it changes when
+    * registers free up, which can tip a tight shader over).
     */
    for (int chain = 1; chain >= 0; chain--) {
       for (int order = 0; order < 5; order++)
@@ -3187,22 +3211,27 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
                          INT_MAX, chain && !order ? error : &err))
             return true;
 
-      struct grate_fp_shader two[GRATE_FP_MAX_SEGMENTS];
-      int n2 = 0;
-      bool ok2 = ladder(two, &n2, s, chain, 2, &err);
-      bool ok1 = ladder(fps, num_segments, s, chain, 1, &err);
-      if (ok2 && (!ok1 || program_cost(two, n2) < program_cost(fps, *num_segments))) {
-         for (int k = 0; k < *num_segments; k++)
-            fp_clear(&fps[k]);
-         for (int k = 0; k < n2; k++)
-            fp_move(&fps[k], &two[k]);
-         *num_segments = n2;
-         return true;
+      /* one row in fps, then two and four rows: the cheapest one wins */
+      bool ok = ladder(fps, num_segments, s, chain, 1, &err);
+      for (int rows = 2; rows <= 4; rows *= 2) {
+         struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
+         int n = 0;
+         if (!ladder(alt, &n, s, chain, rows, &err))
+            continue;
+         if (!ok || program_cost(alt, n) < program_cost(fps, *num_segments)) {
+            if (ok)
+               for (int k = 0; k < *num_segments; k++)
+                  fp_clear(&fps[k]);
+            for (int k = 0; k < n; k++)
+               fp_move(&fps[k], &alt[k]);
+            *num_segments = n;
+            ok = true;
+         } else {
+            for (int k = 0; k < n; k++)
+               fp_clear(&alt[k]);
+         }
       }
-      if (ok2)
-         for (int k = 0; k < n2; k++)
-            fp_clear(&two[k]);
-      if (ok1)
+      if (ok)
          return true;
    }
    return false;
