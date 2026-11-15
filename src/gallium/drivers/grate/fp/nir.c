@@ -2171,9 +2171,39 @@ emit_tex(struct comp *c, nir_tex_instr *tex)
       };
 }
 
+/* only intrinsics' constant offsets read it: no immediate needed */
+static bool
+only_offsets(nir_def *def)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src))
+         return false;
+      nir_instr *user = nir_src_parent_instr(src);
+      if (user->type != nir_instr_type_intrinsic)
+         return false;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(user);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_ubo_vec4:
+      case nir_intrinsic_load_input:
+      case nir_intrinsic_load_interpolated_input:
+         break;
+      case nir_intrinsic_store_output:
+         if (src == &intr->src[0])
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
 static void
 emit_load_const(struct comp *c, nir_load_const_instr *lc)
 {
+   if (only_offsets(&lc->def))
+      return;
    for (unsigned k = 0; k < lc->def.num_components; k++)
       *def_val(c, &lc->def, k) = imm_val(c, nir_const_value_as_float(
                                          lc->value[k], lc->def.bit_size));
