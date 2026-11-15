@@ -316,6 +316,48 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
    }
 }
 
+/*
+ * An instruction fetches one uniform and one attribute (a single fetch
+ * index each, see vp/pack.c): further distinct uniforms or attributes are
+ * read through temporaries, moved there first. Immediates are uniforms
+ * too, so CONST + IMM needs this.
+ */
+#define VP_SCRATCH_TEMP 31
+
+static void
+legalize_fetches(struct grate_vp_shader *vp, struct vp_instr *instr)
+{
+   struct vp_src_operand *srcs[4] = {
+      &instr->vec.src[0], &instr->vec.src[1], &instr->vec.src[2],
+      &instr->scalar.src,
+   };
+   int uniform = -1, attr = -1, scratch = VP_SCRATCH_TEMP;
+   for (int i = 0; i < 4; i++) {
+      struct vp_src_operand *src = srcs[i];
+      int *fetch;
+      if (src->file == VP_SRC_FILE_UNIFORM)
+         fetch = &uniform;
+      else if (src->file == VP_SRC_FILE_ATTRIB)
+         fetch = &attr;
+      else
+         continue;
+      if (*fetch < 0 || *fetch == src->index) {
+         *fetch = src->index;
+         continue;
+      }
+      /* the whole register into a temporary, then read it from there */
+      static const enum vp_swz xyzw[4] = { VP_SWZ_X, VP_SWZ_Y, VP_SWZ_Z, VP_SWZ_W };
+      struct vp_src_operand whole = *src;
+      memcpy(whole.swizzle, xyzw, sizeof(xyzw));
+      whole.negate = whole.absolute = false;
+      struct vp_instr *mov = emit_packed(emit_vMOV(dst_temp(scratch, 0xf, false), whole),
+                                         emit_sNOP());
+      list_addtail(&mov->link, &vp->instructions);
+      src->file = VP_SRC_FILE_TEMP;
+      src->index = scratch--;
+   }
+}
+
 void
 grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
 {
@@ -330,6 +372,7 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
             struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);
+            legalize_fetches(vp, instr);
             list_addtail(&instr->link, &vp->instructions);
          }
          break;
