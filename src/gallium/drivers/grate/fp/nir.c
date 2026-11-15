@@ -97,6 +97,10 @@ struct comp {
    int num_batches;
    /* row register occupancy for the allocator: batch it's free from */
    int reg_busy_until[MAX_ROW_REGS];
+   /* batch of the last ALU write to each register (-1: none in this pass):
+    * an I/O stage writing it later in the same round of rows batches would
+    * lose to that write, which lands last */
+   int alu_write_batch[MAX_ROW_REGS];
    int max_reg;
 
    /* the ALU packet still taking slots, its batch, and the row registers
@@ -992,11 +996,60 @@ free_pair(struct comp *c)
    return best;
 }
 
+static void reload_values(struct comp *c, int slot, int q);
+
+/*
+ * With several rows, the PSEQ of batch k reads a slot back into a pair of
+ * row k % rows: take a free pair on the current batch's row or on one of
+ * the next batches', instead of padding to a batch on row 0. Only rows 0
+ * and the last: with the PSEQ on the middle rows of four, a three-pass
+ * gradient comes out wrong on the hardware (not understood yet). The pair
+ * mustn't have an ALU write earlier in the same round, which would land
+ * after the PSEQ.
+ */
+static bool
+reload_other_row(struct comp *c, int slot)
+{
+   for (int ahead = 0; ahead < c->rows; ahead++) {
+      int bi = c->num_batches - 1 + ahead;
+      if (bi < 0 || (ahead == 0 && (!c->cur || c->cur->pseq)))
+         continue;
+      int row = bi % c->rows, round = bi - row;
+      if (row != 0 && row != c->rows - 1)
+         continue;
+      for (int q = 4 * row; q < 4 * row + 4; q += 2) {
+         bool ok = true;
+         for (int h = 0; h < 2; h++) {
+            int r = q + h;
+            ok &= r != 4; /* the interpolation setup reads r4 */
+            ok &= c->reg_busy_until[r] <= c->num_batches;
+            ok &= c->alu_write_batch[r] < round;
+            ok &= !(ahead == 0 && (c->touched & (1u << r)));
+         }
+         if (!ok)
+            continue;
+         struct fp_instr *b = c->cur;
+         for (int k = 0; k < ahead; k++)
+            b = new_batch(c);
+         c->touched |= 3u << q;
+         c->written |= 3u << q;
+         b->pseq = 0x00800008 | (q % 4 ? 0x2 : 0x0) | (SPILL_RT_FIRST + slot) << 16;
+         c->slot_last[slot] = MAX2(c->slot_last[slot], c->num_batches - 1);
+         c->max_reg = MAX2(c->max_reg, q + 1);
+         reload_values(c, slot, q);
+         return true;
+      }
+   }
+   return false;
+}
+
 /* PSEQ a slot back into a free pair, with everything still live in it */
 static void
 reload(struct comp *c, struct val *v)
 {
    int slot = v->spill - 1;
+   if (c->rows > 1 && reload_other_row(c, slot))
+      return;
    int q = free_pair(c);
    if (q < 0) {
       fail(c, "out of row registers (3)");
@@ -1018,6 +1071,13 @@ reload(struct comp *c, struct val *v)
    c->slot_last[slot] = MAX2(c->slot_last[slot], c->num_batches - 1);
    c->max_reg = MAX2(c->max_reg, q + 1);
 
+   reload_values(c, slot, q);
+}
+
+/* the values a slot holds are in pair q now */
+static void
+reload_values(struct comp *c, int slot, int q)
+{
    bool rgba8 = c->slot_rgba8[slot];
    for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
       struct val *w = &c->vals[i];
@@ -1568,12 +1628,13 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
 
    int k = c->pkt_slots++;
    struct fp_alu_instr *slot = &c->pkt->slots[k];
-   if (dst->index < 4)
+   if (dst->index < 16) {
       c->touched |= 1u << dst->index;
-   if (dst->index < 16)
       c->written |= 1u << dst->index;
+      c->alu_write_batch[dst->index] = c->num_batches - 1;
+   }
    for (int i = 0; i < 3; i++)
-      if (srcs[i]->index < 4)
+      if (srcs[i]->index < 16)
          c->touched |= 1u << srcs[i]->index;
    slot->op = op;
    slot->dst = dst_of(dst, sat);
@@ -2505,6 +2566,7 @@ segment_begin(struct comp *c, struct grate_fp_shader *fp)
    }
    /* the slots were written by an earlier pass, if at all */
    memset(c->slot_last, 0, sizeof(c->slot_last));
+   memset(c->alu_write_batch, 0xff, sizeof(c->alu_write_batch));
 }
 
 /* everything still in a register goes to a spill slot, for the next pass */
@@ -3126,6 +3188,16 @@ grate_nir_fs_lower(nir_shader *s)
  * Then the same orders again, spilling to render targets when registers
  * run out.
  */
+/* batches drawn, and a full-screen pass costs as much as a few */
+static int
+program_cost(struct grate_fp_shader *fps, int n)
+{
+   int cost = 8 * (n - 1);
+   for (int k = 0; k < n; k++)
+      cost += list_length(&fps[k].fp_instructions);
+   return cost;
+}
+
 static bool
 try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
             int order, bool spill, bool chain, int rows, int max_segments,
@@ -3163,15 +3235,26 @@ fp_move(struct grate_fp_shader *to, struct grate_fp_shader *from)
    list_inithead(&from->mfu_instructions);
 }
 
-/* batches drawn, and a full-screen pass costs as much as a few */
-static int
-program_cost(struct grate_fp_shader *fps, int n)
+/* keep alt (n passes) in fps if fps holds nothing yet (*fit) or costs more */
+static void
+keep_cheaper(struct grate_fp_shader *fps, int *num_segments, bool *fit,
+             struct grate_fp_shader *alt, int n)
 {
-   int cost = 8 * (n - 1);
+   if (*fit && program_cost(alt, n) >= program_cost(fps, *num_segments)) {
+      for (int k = 0; k < n; k++)
+         fp_clear(&alt[k]);
+      return;
+   }
+   if (*fit)
+      for (int k = 0; k < *num_segments; k++)
+         fp_clear(&fps[k]);
    for (int k = 0; k < n; k++)
-      cost += list_length(&fps[k].fp_instructions);
-   return cost;
+      fp_move(&fps[k], &alt[k]);
+   *num_segments = n;
+   *fit = true;
 }
+
+
 
 /* with spilling: every order in one pass, then several passes */
 static bool
@@ -3179,15 +3262,21 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
        bool chain, int rows, const char **err)
 {
    static const int cuts[] = { 56, 48, 40, 32 };
-   for (int order = 0; order < 5; order++)
-      if (try_compile(fps, num_segments, s, order, true, chain, rows, 1,
-                      INT_MAX, err))
+   /* one pass, then several, each with every order: the cheapest wins */
+   for (int i = -1; i < (int)ARRAY_SIZE(cuts); i++) {
+      bool fit = false;
+      for (int order = 0; order < 5; order++) {
+         struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
+         int n = 0;
+         if (!try_compile(alt, &n, s, order, true, chain, rows,
+                          i < 0 ? 1 : GRATE_FP_MAX_SEGMENTS,
+                          i < 0 ? INT_MAX : cuts[i], err))
+            continue;
+         keep_cheaper(fps, num_segments, &fit, alt, n);
+      }
+      if (fit)
          return true;
-   for (unsigned i = 0; i < ARRAY_SIZE(cuts); i++)
-      for (int order = 4; order >= 0; order--)
-         if (try_compile(fps, num_segments, s, order, true, chain, rows,
-                         GRATE_FP_MAX_SEGMENTS, cuts[i], err))
-            return true;
+   }
    return false;
 }
 
@@ -3206,10 +3295,17 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
     * registers free up, which can tip a tight shader over).
     */
    for (int chain = 1; chain >= 0; chain--) {
-      for (int order = 0; order < 5; order++)
-         if (try_compile(fps, num_segments, s, order, false, chain, 1, 1,
-                         INT_MAX, chain && !order ? error : &err))
-            return true;
+      /* every order that fits: the cheapest wins */
+      bool fit = false;
+      for (int order = 0; order < 5; order++) {
+         struct grate_fp_shader alt[1];
+         int n = 0;
+         if (try_compile(alt, &n, s, order, false, chain, 1, 1, INT_MAX,
+                         chain && !order ? error : &err))
+            keep_cheaper(fps, num_segments, &fit, alt, n);
+      }
+      if (fit)
+         return true;
 
       /* one row in fps, then two and four rows: the cheapest one wins */
       bool ok = ladder(fps, num_segments, s, chain, 1, &err);
