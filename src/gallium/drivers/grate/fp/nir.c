@@ -97,6 +97,13 @@ struct comp {
    int num_batches;
    /* row register occupancy for the allocator: batch it's free from */
    int reg_busy_until[MAX_ROW_REGS];
+   /*
+    * The vals that may be anything but VAL_NONE (those of the instructions
+    * emitted so far that haven't died), in val order: what the loops over
+    * live values walk instead of every val.
+    */
+   unsigned *act;
+   unsigned nact;
    /* batch of the last ALU write to each register (-1: none in this pass):
     * an I/O stage writing it later in the same round of rows batches would
     * lose to that write, which lands last */
@@ -158,6 +165,9 @@ struct comp {
    struct grate_fp_expr exprs[GRATE_FP_MAX_EXPRS];
    int num_exprs;
 };
+
+#define foreach_active(c, i) \
+   for (unsigned _a = 0, i = 0; _a < (c)->nact && ((i = (c)->act[_a]), 1); _a++)
 
 static struct val *
 def_val(struct comp *c, nir_def *def, unsigned comp)
@@ -548,7 +558,7 @@ static bool spill_regs(struct comp *c, int lo, unsigned mask);
 static void
 evict(struct comp *c, int lo, int hi, struct val *const *keep, int nkeep)
 {
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind != VAL_ROW || v->index < lo || v->index > hi)
          continue;
@@ -655,7 +665,7 @@ val_varying(struct comp *c, struct val *v, unsigned *loc, unsigned *comp)
 static bool
 slot_in_use(struct comp *c, int slot)
 {
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if ((v->kind == VAL_ROW || v->kind == VAL_SPILLED) && v->spill == slot + 1)
          return true;
@@ -678,7 +688,7 @@ reg_score(struct comp *c, int r, bool *fx10)
    bool live = false, copied = true, store = false;
    unsigned next = UINT_MAX;
    *fx10 = false;
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind != VAL_ROW || v->index != r)
          continue;
@@ -720,7 +730,7 @@ seen_in(struct comp *c, int def, int bi)
 static bool
 pair_visible(struct comp *c, int lo, unsigned mask, int bi)
 {
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1 &&
           (mask & (1u << (v->index - lo))) &&
@@ -756,7 +766,7 @@ static bool
 spill_regs(struct comp *c, int lo, unsigned mask)
 {
    bool fx10[2] = { false, false }, store[2] = { false, false };
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       unsigned loc, comp;
       if (v->kind != VAL_ROW || v->index < lo || v->index > lo + 1 ||
@@ -828,7 +838,7 @@ spill_regs(struct comp *c, int lo, unsigned mask)
       }
    }
 
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind != VAL_ROW || v->index < lo || v->index > lo + 1 ||
           !(mask & (1u << (v->index - lo))))
@@ -912,7 +922,7 @@ compact_pair(struct comp *c)
              * one into the same half (with its other half, if live)
              */
             bool movable = false;
-            for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+            foreach_active(c, i) {
                struct val *v = &c->vals[i];
                if (v->kind == VAL_ROW && v->index == q + h)
                   movable = true;
@@ -942,7 +952,7 @@ compact_pair(struct comp *c)
          }
          if (r < 0)
             return -1;
-         for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+         foreach_active(c, i) {
             struct val *v = &c->vals[i];
             if (v->kind != VAL_ROW || v->index != q + h)
                continue;
@@ -1079,7 +1089,7 @@ static void
 reload_values(struct comp *c, int slot, int q)
 {
    bool rgba8 = c->slot_rgba8[slot];
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *w = &c->vals[i];
       if (w->kind != VAL_SPILLED || w->spill != slot + 1)
          continue;
@@ -1768,7 +1778,7 @@ store_component(nir_def *def)
 static bool
 half_free(struct comp *c, nir_alu_instr *alu, int reg, bool high)
 {
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind != VAL_ROW || v->index != reg || (v->fx10 && v->high != high))
          continue;
@@ -2117,7 +2127,7 @@ static int
 pair_live_after(struct comp *c, int lo, nir_tex_instr *tex, int coord)
 {
    int n = 0;
-   for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+   foreach_active(c, i) {
       struct val *v = &c->vals[i];
       if (v->kind != VAL_ROW || v->index < lo || v->index > lo + 1)
          continue;
@@ -2344,8 +2354,12 @@ free_dead(nir_src *src, void *data)
       v->kind = VAL_NONE;
       /* the other fx10 half may still be live */
       bool shared = false;
-      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++)
-         shared |= c->vals[i].kind == VAL_ROW && c->vals[i].index == v->index;
+      foreach_active(c, i) {
+         if (c->vals[i].kind == VAL_ROW && c->vals[i].index == v->index) {
+            shared = true;
+            break;
+         }
+      }
       if (!shared)
          c->reg_busy_until[v->index] = MIN2(c->reg_busy_until[v->index],
                                             MAX2(v->last, c->num_batches));
@@ -2576,7 +2590,7 @@ spill_all(struct comp *c)
    c->nprotect = 0;
    for (int lo = 0; lo < 4 * c->rows && !c->error; lo += 2) {
       unsigned mask = 0;
-      for (unsigned i = 0; i < c->num_defs * NIR_MAX_VEC_COMPONENTS; i++) {
+      foreach_active(c, i) {
          struct val *v = &c->vals[i];
          if (v->kind == VAL_ROW && v->index >= lo && v->index <= lo + 1)
             mask |= 1u << (v->index - lo);
@@ -2642,6 +2656,21 @@ fp_clear(struct grate_fp_shader *fp)
    list_inithead(&fp->mfu_instructions);
 }
 
+/* drop the dead vals from the active list, add those of instr */
+static void
+track_active(struct comp *c, nir_instr *instr)
+{
+   unsigned n = 0;
+   for (unsigned a = 0; a < c->nact; a++)
+      if (c->vals[c->act[a]].kind != VAL_NONE)
+         c->act[n++] = c->act[a];
+   c->nact = n;
+   nir_def *def = nir_instr_def(instr);
+   if (def)
+      for (unsigned k = 0; k < def->num_components; k++)
+         c->act[c->nact++] = def->index * NIR_MAX_VEC_COMPONENTS + k;
+}
+
 /*
  * Compile into up to max_segments programs (passes). A pass ends once it
  * holds `cut` batches or `ucut` uniforms: what's live then goes to spill
@@ -2669,6 +2698,8 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
    nir_index_instrs(impl);
    c.num_defs = impl->ssa_alloc;
    c.vals = CALLOC(c.num_defs * NIR_MAX_VEC_COMPONENTS, sizeof(struct val));
+   c.act = MALLOC(c.num_defs * NIR_MAX_VEC_COMPONENTS * sizeof(unsigned));
+   c.nact = 0;
 
    c.allow_spill = allow_spill;
    c.defs = CALLOC(c.num_defs, sizeof(nir_def *));
@@ -2685,6 +2716,7 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
             break;
          c.cur_index = instr->index;
          c.nprotect = 0;
+         track_active(&c, instr);
 
          /* a full pass: hand over to the next one */
          if (seg + 1 < max_segments && !is_copy(instr) &&
@@ -2750,6 +2782,7 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
    }
 
    FREE(c.vals);
+   FREE(c.act);
    FREE(c.defs);
    *error = c.error;
 
