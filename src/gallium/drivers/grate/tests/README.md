@@ -24,8 +24,9 @@ doesn't have yet: `shader_runner-blend.patch` adds `enable GL_BLEND` and
   row registers: register spilling to render targets.
 - `skia-*`: fragment shaders from Skia's GL backend (antialiased quad,
   rounded-rect clip, gaussian blur, and the blur with decal edges,
-  quadratic-edge coverage with derivatives);
-  `skia-aa-quad-vs` uses Skia's vertex shader and attribute layout too.
+  quadratic-edge coverage with derivatives, a multi-stop gradient);
+  `skia-aa-quad-vs` and `skia-gradient` use Skia's vertex shader and
+  attribute layout too.
 
 Avoid running untested programs while a compositor is drawing: a bad
 program can hang GR3D, and only a reboot clears that.
