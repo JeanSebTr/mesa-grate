@@ -2630,6 +2630,13 @@ segment_end(struct comp *c)
    }
    if (!c->error && c->num_batches > 63)
       fail(c, "program too long");
+   /*
+    * With several rows, ALU packets past the 64th come out wrong on the
+    * hardware (earlier packets lose results), for two, three and four
+    * rows alike.
+    */
+   if (!c->error && c->rows > 1 && list_length(&fp->alu_instructions) > 64)
+      fail(c, "too many ALU packets for several rows");
 
    /* the linker needs at least one instruction */
    if (!fp->info.num_inputs) {
