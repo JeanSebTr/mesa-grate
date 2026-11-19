@@ -744,7 +744,7 @@ emit_vs_uniforms(struct grate_context *context)
       memcpy(consts, constbuf->user_buffer, len * 4);
    }
 
-   /* immediates live at the top of the uniform space, see vp/tgsi.c */
+   /* immediates live at the top of the uniform space, see vp/nir.c */
    for (int i = 0; i < vs->num_immediates; i++)
       memcpy(&consts[(255 - i) * 4], vs->immediates[i], 4 * sizeof(uint32_t));
 
