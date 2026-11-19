@@ -75,6 +75,7 @@ grate_create_vs_state(struct pipe_context *pcontext,
 
    memcpy(so->immediates, vp.immediates, sizeof(so->immediates));
    so->num_immediates = vp.num_immediates;
+   so->num_consts = vp.num_consts;
 
    so->blob.commands = commands;
    so->blob.num_commands = num_commands;
@@ -96,7 +97,9 @@ grate_bind_vs_state(struct pipe_context *pcontext, void *so)
 static void
 grate_delete_vs_state(struct pipe_context *pcontext, void *so)
 {
-   FREE(so);
+   struct grate_vertex_shader_state *vs = so;
+   FREE(vs->blob.commands);
+   FREE(vs);
 }
 
 static void

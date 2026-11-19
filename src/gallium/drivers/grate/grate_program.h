@@ -16,6 +16,7 @@ struct grate_vertex_shader_state {
    struct grate_shader_blob blob;
    uint16_t output_mask;
    uint16_t output_semantic[16];
+   int num_consts;
    uint32_t immediates[32][4];
    int num_immediates;
 };

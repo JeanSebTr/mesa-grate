@@ -14,7 +14,9 @@ struct grate_vp_shader {
    uint16_t output_mask;
    /* semantic (name << 8 | index) of each output register, for linking */
    uint16_t output_semantic[16];
-   /* constants, uploaded from the top of the 256 VP uniforms down */
+   /* uniforms the program reads: 0 .. num_consts - 1 */
+   int num_consts;
+   /* constants, in the uniforms right after those */
    uint32_t immediates[32][4];
    int num_immediates;
 };
