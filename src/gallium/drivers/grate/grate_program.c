@@ -213,7 +213,8 @@ grate_fs_compile(struct grate_context *context,
    }
 
    const char *error = NULL;
-   bool supported = grate_nir_to_fp(fps, &num_segments, fs->nir, &error);
+   bool supported = grate_nir_to_fp(fps, &num_segments, fs->nir,
+                                    mode != GRATE_BLEND_NONE, &error);
    if (!supported) {
       /* drawn as nothing, see fp/nir.c */
       fprintf(stderr, "grate: fragment shader not supported: %s\n", error);

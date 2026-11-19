@@ -155,6 +155,7 @@ struct comp {
     * they only go in batches 0 mod n here (row 0, r0-r3, as with one row).
     */
    int rows;
+   bool blended; /* blending appends to the last pass, see segment_end() */
    /* row registers some stage writes in the current batch, and those the
     * batch before wrote if it isn't the last of a round of n: the batch
     * right after it doesn't see them yet (only the one after that, or
@@ -1345,7 +1346,6 @@ emit_interpolation(struct comp *c, int e, int n, const int *reg)
       }
       c->touched |= regs;
    c->written |= regs;
-      c->written |= regs;
       return;
    }
    struct fp_instr *inst = fits && !c->cur->mfu_sched.num_instructions ?
@@ -2604,7 +2604,7 @@ spill_all(struct comp *c)
 }
 
 static void
-segment_end(struct comp *c)
+segment_end(struct comp *c, bool last)
 {
    struct grate_fp_shader *fp = c->fp;
 
@@ -2631,14 +2631,21 @@ segment_end(struct comp *c)
          list_addtail(&p->link, &fp->alu_instructions);
       }
    }
-   if (!c->error && c->num_batches > 63)
+   /*
+    * The last pass writes the colour, and blending appends two batches
+    * (rows each) and as many ALU packets to it (grate_fp_append_blend()):
+    * leave room for them when the program is for a blended draw.
+    */
+   int reserve = last && c->blended ? 2 * c->rows : 0;
+   if (!c->error && c->num_batches + reserve > 63)
       fail(c, "program too long");
    /*
     * With several rows, ALU packets past the 64th come out wrong on the
     * hardware (earlier packets lose results), for two, three and four
     * rows alike.
     */
-   if (!c->error && c->rows > 1 && list_length(&fp->alu_instructions) > 64)
+   if (!c->error && c->rows > 1 &&
+       list_length(&fp->alu_instructions) + reserve > 64)
       fail(c, "too many ALU packets for several rows");
 
    /* the linker needs at least one instruction */
@@ -2689,9 +2696,10 @@ track_active(struct comp *c, nir_instr *instr)
 static bool
 compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
         int *num_segments, nir_shader *s, bool allow_spill, bool allow_chain,
-        int rows, const char **error)
+        int rows, bool blended, const char **error)
 {
-   struct comp c = { .nir = s, .allow_chain = allow_chain, .rows = rows };
+   struct comp c = { .nir = s, .allow_chain = allow_chain, .rows = rows,
+                     .blended = blended };
    struct grate_fp_shader *fp = &fps[0];
    int seg = 0;
 
@@ -2733,7 +2741,7 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
              instr->type != nir_instr_type_load_const &&
              (c.num_batches >= cut || c.fp->info.num_uniforms >= ucut)) {
             spill_all(&c);
-            segment_end(&c);
+            segment_end(&c, false);
             if (c.error)
                break;
             fp = &fps[++seg];
@@ -2780,7 +2788,7 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
    }
 
    if (!c.error)
-      segment_end(&c);
+      segment_end(&c, true);
 
    for (int k = 0; k <= seg; k++) {
       memcpy(fps[k].info.exprs, c.exprs, sizeof(c.exprs));
@@ -3243,8 +3251,8 @@ program_cost(struct grate_fp_shader *fps, int n)
 
 static bool
 try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
-            int order, bool spill, bool chain, int rows, int max_segments,
-            int cut, const char **error)
+            bool blended, int order, bool spill, bool chain, int rows,
+            int max_segments, int cut, const char **error)
 {
    const nir_schedule_options sched = { .threshold = 4, .fallback = true };
    nir_shader *v = nir_shader_clone(NULL, s);
@@ -3259,7 +3267,7 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
          NIR_PASS(_, v, nir_schedule, &sched);
    }
    bool ok = compile(fps, max_segments, cut, 28, num_segments, v, spill, chain,
-                     rows, error);
+                     rows, blended, error);
    ralloc_free(v);
    return ok;
 }
@@ -3302,7 +3310,7 @@ keep_cheaper(struct grate_fp_shader *fps, int *num_segments, bool *fit,
 /* with spilling: every order in one pass, then several passes */
 static bool
 ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
-       bool chain, int rows, const char **err)
+       bool blended, bool chain, int rows, const char **err)
 {
    static const int cuts[] = { 56, 48, 40, 32 };
    /* one pass, then several, each with every order: the cheapest wins */
@@ -3311,7 +3319,7 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
       for (int order = 0; order < 5; order++) {
          struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
          int n = 0;
-         if (!try_compile(alt, &n, s, order, true, chain, rows,
+         if (!try_compile(alt, &n, s, blended, order, true, chain, rows,
                           i < 0 ? 1 : GRATE_FP_MAX_SEGMENTS,
                           i < 0 ? INT_MAX : cuts[i], err))
             continue;
@@ -3325,7 +3333,7 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
 
 bool
 grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
-                const char **error)
+                bool blended, const char **error)
 {
    const char *err = NULL;
 
@@ -3343,7 +3351,7 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
       for (int order = 0; order < 5; order++) {
          struct grate_fp_shader alt[1];
          int n = 0;
-         if (try_compile(alt, &n, s, order, false, chain, 1, 1, INT_MAX,
+         if (try_compile(alt, &n, s, blended, order, false, chain, 1, 1, INT_MAX,
                          chain && !order ? error : &err))
             keep_cheaper(fps, num_segments, &fit, alt, n);
       }
@@ -3351,11 +3359,11 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
          return true;
 
       /* one row in fps, then two and four rows: the cheapest one wins */
-      bool ok = ladder(fps, num_segments, s, chain, 1, &err);
+      bool ok = ladder(fps, num_segments, s, blended, chain, 1, &err);
       for (int rows = 2; rows <= 4; rows *= 2) {
          struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
          int n = 0;
-         if (!ladder(alt, &n, s, chain, rows, &err))
+         if (!ladder(alt, &n, s, blended, chain, rows, &err))
             continue;
          if (!ok || program_cost(alt, n) < program_cost(fps, *num_segments)) {
             if (ok)
