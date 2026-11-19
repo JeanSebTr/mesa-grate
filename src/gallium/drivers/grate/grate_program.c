@@ -4,17 +4,12 @@
 #include "util/u_dynarray.h"
 #include "util/u_memory.h"
 
-#include "nir/nir_to_tgsi.h"
 #include "nir/tgsi_to_nir.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_serialize.h"
 #include "util/blob.h"
 #include "util/disk_cache.h"
 #include "util/u_debug.h"
-#include "tgsi/tgsi_dump.h"
-#include "tgsi/tgsi_parse.h"
-#include "tgsi/tgsi_scan.h"
-#include "tgsi/tgsi_transform.h"
 
 #include "host1x01_hardware.h"
 #include "grate_common.h"
@@ -26,78 +21,6 @@
 #include "vp/vpir.h"
 #include "tgr_3d.xml.h"
 
-struct grate_vs_tgsi_transform_context {
-   struct tgsi_transform_context base;
-   unsigned next_temp;
-};
-
-static void
-grate_vs_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
-                                    struct tgsi_full_instruction *inst)
-{
-   struct grate_vs_tgsi_transform_context *gctx =
-      (struct grate_vs_tgsi_transform_context *)ctx;
-
-   int const_index = -1;
-   for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
-      if (inst->Src[i].Register.File != TGSI_FILE_CONSTANT)
-         continue;
-
-      if (const_index < 0)
-         const_index = inst->Src[i].Register.Index;
-      else if (inst->Src[i].Register.Index != const_index) {
-         /* We already have a constant-reads in this instruction,
-          * add extra instructions in order to read more
-          */
-         unsigned temp = gctx->next_temp++;
-         tgsi_transform_temp_decl(ctx, temp);
-         /* insert MOV to temp */
-         tgsi_transform_op1_inst(ctx, TGSI_OPCODE_MOV,
-                                 /* dst reg */
-                                 TGSI_FILE_TEMPORARY, temp,
-                                 TGSI_WRITEMASK_XYZW,
-                                 /* src reg */
-                                 TGSI_FILE_CONSTANT,
-                                 inst->Src[i].Register.Index);
-
-         /* rewrite instruction */
-	 tgsi_transform_src_reg_xyzw(&inst->Src[i], TGSI_FILE_TEMPORARY, temp);
-	 inst->Src[i].Register.File = TGSI_FILE_TEMPORARY;
-         inst->Src[i].Register.Index = temp;
-      }
-   }
-
-   ctx->emit_instruction(ctx, inst);
-}
-
-static struct tgsi_token *
-grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
-{
-   const unsigned new_len = tgsi_num_tokens(tokens_in) + 100;
-
-   struct tgsi_shader_info info;
-   tgsi_scan_shader(tokens_in, &info);
-
-   struct grate_vs_tgsi_transform_context ctx = {};
-   ctx.base.transform_instruction = grate_vs_tgsi_transform_instruction;
-   ctx.next_temp = info.file_max[TGSI_FILE_TEMPORARY] + 1;
-
-   return tgsi_transform_shader(tokens_in, new_len, &ctx.base);
-}
-
-
-/* Mesa hands drivers NIR; grate still compiles TGSI. */
-static const struct tgsi_token *
-grate_shader_tokens(struct pipe_context *pcontext,
-                    const struct pipe_shader_state *template)
-{
-   if (template->type == PIPE_SHADER_IR_NIR)
-      return nir_to_tgsi(template->ir.nir, pcontext->screen);
-
-   assert(template->type == PIPE_SHADER_IR_TGSI);
-   return tgsi_dup_tokens(template->tokens);
-}
-
 static void *
 grate_create_vs_state(struct pipe_context *pcontext,
                       const struct pipe_shader_state *template)
@@ -108,31 +31,26 @@ grate_create_vs_state(struct pipe_context *pcontext,
    if (!so)
       return NULL;
 
-   const struct tgsi_token *tokens = grate_shader_tokens(pcontext, template);
-   if (!tokens) {
-      FREE(so);
-      return NULL;
-   }
-
-   if (grate_debug & GRATE_DEBUG_TGSI) {
-      fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(tokens, 0);
-      fprintf(stderr, "\n");
-   }
-
-   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(tokens);
-   FREE((void *)tokens);
-   if (!new_tokens) {
-      FREE(so);
-      return NULL;
-   }
-
-   struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, new_tokens);
-   assert(ok == TGSI_PARSE_OK);
+   /* Mesa's own utility shaders can still come as TGSI */
+   nir_shader *nir = template->type == PIPE_SHADER_IR_NIR ? template->ir.nir :
+                     tgsi_to_nir(template->tokens, pcontext->screen, false);
+   grate_nir_vs_lower(nir);
+   if (grate_debug & GRATE_DEBUG_VS)
+      nir_print_shader(nir, stderr);
 
    struct grate_vp_shader vp;
-   grate_tgsi_to_vp(&vp, &parser);
+   const char *error = NULL;
+   if (!grate_nir_to_vp(&vp, nir, &error)) {
+      /* the position stays zero: draws nothing */
+      fprintf(stderr, "grate: unsupported vertex shader (%s)\n", error);
+      if (!(grate_debug & GRATE_DEBUG_VS))
+         nir_print_shader(nir, stderr);
+      list_inithead(&vp.instructions);
+      struct vp_instr *nop = CALLOC_STRUCT(vp_instr);
+      nop->vec.dst.file = nop->scalar.dst.file = VP_DST_FILE_UNDEF;
+      list_addtail(&nop->link, &vp.instructions);
+   }
+   ralloc_free(nir);
 
    int num_instructions = list_length(&vp.instructions);
    assert(num_instructions < 256);
@@ -162,6 +80,9 @@ grate_create_vs_state(struct pipe_context *pcontext,
    so->blob.num_commands = num_commands;
    so->output_mask = vp.output_mask;
    memcpy(so->output_semantic, vp.output_semantic, sizeof(so->output_semantic));
+
+   list_for_each_entry_safe(struct vp_instr, instr, &vp.instructions, link)
+      FREE(instr);
 
    return so;
 }

@@ -5,7 +5,6 @@
 
 #include <stdint.h>
 
-struct tgsi_parse_context;
 struct grate_fp_shader;
 struct fp_instr;
 struct fp_mfu_instr;
@@ -15,7 +14,7 @@ struct grate_vp_shader {
    uint16_t output_mask;
    /* semantic (name << 8 | index) of each output register, for linking */
    uint16_t output_semantic[16];
-   /* TGSI immediates, uploaded from the top of the 256 VP uniforms down */
+   /* constants, uploaded from the top of the 256 VP uniforms down */
    uint32_t immediates[32][4];
    int num_immediates;
 };
@@ -105,7 +104,14 @@ struct grate_fp_shader {
 };
 
 void
-grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi);
+grate_varying_semantic(unsigned location, unsigned *name, unsigned *index);
+
+void
+grate_nir_vs_lower(struct nir_shader *s);
+
+bool
+grate_nir_to_vp(struct grate_vp_shader *vp, struct nir_shader *s,
+                const char **error);
 
 /*
  * Blending is done in the fragment program: GR3D has no blend unit.

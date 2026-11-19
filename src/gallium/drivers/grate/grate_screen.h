@@ -9,7 +9,7 @@ struct drm_tegra;
 extern uint32_t grate_debug;
 
 #define GRATE_DEBUG_UNIMPLEMENTED 0x1
-#define GRATE_DEBUG_TGSI 0x2
+#define GRATE_DEBUG_VS   0x2
 #define GRATE_DEBUG_FS   0x4
 
 struct grate_screen {

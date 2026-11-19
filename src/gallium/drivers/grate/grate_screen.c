@@ -23,8 +23,8 @@
 static const struct debug_named_value debug_options[] = {
    { "unimplemented", GRATE_DEBUG_UNIMPLEMENTED,
      "Print unimplemented functions" },
-   { "tgsi", GRATE_DEBUG_TGSI,
-     "Dump TGSI during program compile" },
+   { "vs", GRATE_DEBUG_VS,
+     "Print vertex shaders as NIR" },
    { "fs", GRATE_DEBUG_FS,
      "Print fragment shaders as NIR (all of them, or with the failure for unsupported ones)" },
    { NULL }

@@ -1187,9 +1187,12 @@ setup_barycentrics(struct fp_mfu_instr *mfu)
    mfu->mul[1].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1;
 }
 
-/* as nir_to_tgsi names the vertex shader outputs (no TEXCOORD semantic) */
-static void
-varying_semantic(unsigned location, unsigned *name, unsigned *index)
+/*
+ * The name (TGSI semantic) and index the vertex shader outputs and the
+ * fragment shader inputs are linked by (no TEXCOORD semantic).
+ */
+void
+grate_varying_semantic(unsigned location, unsigned *name, unsigned *index)
 {
    if (location >= VARYING_SLOT_VAR0 && location < VARYING_SLOT_PATCH0) {
       *name = TGSI_SEMANTIC_GENERIC;
@@ -1215,7 +1218,7 @@ new_entry(struct comp *c, unsigned location)
 {
    struct grate_fp_info *info = &c->fp->info;
    unsigned name, index;
-   varying_semantic(location, &name, &index);
+   grate_varying_semantic(location, &name, &index);
 
    int row = 0;
    while (row < 16 && c->tram_used[row])
@@ -1396,7 +1399,7 @@ emit_load_input(struct comp *c, nir_intrinsic_instr *intr)
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    unsigned first = nir_intrinsic_component(intr);
    unsigned name, index;
-   varying_semantic(sem.location, &name, &index);
+   grate_varying_semantic(sem.location, &name, &index);
 
    if (name == TGSI_SEMANTIC_COLOR) {
       /*
