@@ -91,7 +91,7 @@ struct grate_fp_info {
 struct nir_shader;
 bool
 grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments,
-                struct nir_shader *s, const char **error);
+                struct nir_shader *s, bool blended, const char **error);
 void
 grate_nir_fs_lower(struct nir_shader *s);
 
