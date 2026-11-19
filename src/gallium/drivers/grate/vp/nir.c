@@ -17,6 +17,8 @@
 
 /* temporaries 28..31 are for the fetch moves of legalize_fetches() */
 #define VP_NUM_TEMPS 28
+/* uniform registers */
+#define vp_num_consts_max 256
 
 enum val_kind {
    VAL_NONE,
@@ -88,7 +90,8 @@ imm_val(struct vp_comp *c, const uint32_t *v, unsigned n)
 {
    struct val r = { .kind = VAL_UNIFORM };
    struct grate_vp_shader *vp = c->vp;
-   for (int s = 0; s <= vp->num_immediates && s < 32; s++) {
+   for (int s = 0; s <= vp->num_immediates && s < 32 &&
+                   vp->num_consts + s < 256; s++) {
       if (s == vp->num_immediates) {
          vp->num_immediates++;
          c->num_imm_comps[s] = 0;
@@ -113,7 +116,7 @@ imm_val(struct vp_comp *c, const uint32_t *v, unsigned n)
          continue;
       memcpy(vp->immediates[s], comps, sizeof(comps));
       c->num_imm_comps[s] = used;
-      r.index = 255 - s;
+      r.index = vp->num_consts + s;
       for (unsigned i = n; i < 4; i++)
          r.comp[i] = r.comp[n - 1];
       return r;
@@ -495,7 +498,7 @@ emit_intrinsic(struct vp_comp *c, nir_intrinsic_instr *intr, unsigned now)
       v->kind = VAL_UNIFORM;
       v->index = offset / 16;
       if (offset % 4 || (offset % 16) / 4 + intr->def.num_components > 4 ||
-          v->index >= 255 - 32) {
+          v->index >= vp_num_consts_max) {
          fail(c, "unsupported uniform load");
          return;
       }
@@ -513,7 +516,7 @@ emit_intrinsic(struct vp_comp *c, nir_intrinsic_instr *intr, unsigned now)
       unsigned first = nir_intrinsic_component(intr);
       v->kind = VAL_UNIFORM;
       v->index = nir_intrinsic_base(intr) + nir_src_as_uint(intr->src[1]);
-      if (first + intr->def.num_components > 4 || v->index >= 255 - 32) {
+      if (first + intr->def.num_components > 4 || v->index >= vp_num_consts_max) {
          fail(c, "unsupported uniform load");
          return;
       }
@@ -795,6 +798,24 @@ grate_nir_to_vp(struct grate_vp_shader *vp, nir_shader *s, const char **error)
    }
    nir_index_ssa_defs(impl);
    nir_index_instrs(impl);
+
+   /* the uniforms read, the constants go after them (see emit_vs_uniforms()) */
+   vp->num_consts = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if ((intr->intrinsic != nir_intrinsic_load_ubo &&
+              intr->intrinsic != nir_intrinsic_load_ubo_vec4) ||
+             !nir_src_is_const(intr->src[1]))
+            continue;
+         unsigned reg = intr->intrinsic == nir_intrinsic_load_ubo ?
+                        nir_src_as_uint(intr->src[1]) / 16 :
+                        nir_intrinsic_base(intr) + nir_src_as_uint(intr->src[1]);
+         vp->num_consts = MAX2(vp->num_consts, (int)MIN2(reg + 1, 256));
+      }
+   }
    c.vals = rzalloc_array(NULL, struct val, impl->ssa_alloc);
 
    for (unsigned i = 0; i < impl->ssa_alloc; i++) {
@@ -857,6 +878,8 @@ grate_nir_to_vp(struct grate_vp_shader *vp, nir_shader *s, const char **error)
 
    if (list_is_empty(&vp->instructions))
       new_instr(&c);
+   if (list_length(&vp->instructions) > 255)
+      fail(&c, "program too long");
 
    ralloc_free(c.vals);
    if (c.error) {

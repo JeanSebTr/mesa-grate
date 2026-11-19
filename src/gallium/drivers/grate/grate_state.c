@@ -733,23 +733,20 @@ emit_vs_uniforms(struct grate_context *context)
    struct grate_stream *stream = &context->gr3d->stream;
    struct pipe_constant_buffer *constbuf = &context->constant_buffer[MESA_SHADER_VERTEX];
    struct grate_vertex_shader_state *vs = context->vshader;
-   uint32_t consts[256 * 4] = { 0 };
-   int len = 0;
+   uint32_t consts[256 * 4];
 
-   if (constbuf->user_buffer != NULL) {
-      assert(constbuf->buffer_size % sizeof(uint32_t) == 0);
-
-      len = constbuf->buffer_size / 4;
-      assert(len < 256 * 4);
-      memcpy(consts, constbuf->user_buffer, len * 4);
-   }
-
-   /* immediates live at the top of the uniform space, see vp/nir.c */
-   for (int i = 0; i < vs->num_immediates; i++)
-      memcpy(&consts[(255 - i) * 4], vs->immediates[i], 4 * sizeof(uint32_t));
-
-   if (vs->num_immediates)
-      len = 256 * 4;
+   /*
+    * The uniforms the program reads, then its constants (see vp/nir.c):
+    * only as many words as it uses.
+    */
+   int len = vs->num_consts * 4;
+   int have = constbuf->user_buffer ? constbuf->buffer_size / 4 : 0;
+   if (have)
+      memcpy(consts, constbuf->user_buffer, MIN2(have, len) * 4);
+   if (have < len)
+      memset(&consts[have], 0, (len - have) * 4);
+   for (int i = 0; i < vs->num_immediates; i++, len += 4)
+      memcpy(&consts[len], vs->immediates[i], 4 * sizeof(uint32_t));
 
    if (len) {
       grate_stream_push(stream, host1x_opcode_imm(TGR3D_VP_UPLOAD_CONST_ID, 0));
