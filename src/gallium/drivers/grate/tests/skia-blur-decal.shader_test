@@ -68,7 +68,7 @@ uniform vec4 uborder_S1_c0_c0_c0 0.0 0.0 0.0 0.0
 uniform vec4 uclamp_S1_c0_c0_c0 0.0 0.0 1.0 1.0
 uniform vec2 uidims_S1_c0_c0_c0 1.0 1.0
 uniform mat3 umatrix_S1_c0_c0 1.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 1.0
-uniform vec2 udir_S1_c0 0.004 0.0
+uniform vec2 udir_S1_c0 0.0035 0.0
 uniform vec4 uoffsetsAndKernel_S1_c0[0] -7.5 0.0625 -6.5 0.0625
 uniform vec4 uoffsetsAndKernel_S1_c0[1] -5.5 0.0625 -4.5 0.0625
 uniform vec4 uoffsetsAndKernel_S1_c0[2] -3.5 0.0625 -2.5 0.0625
@@ -80,5 +80,5 @@ uniform vec4 uoffsetsAndKernel_S1_c0[7] 6.5 0.0625 7.5 0.0625
 draw rect -1 -1 2 2
 probe rgba 30 62 1.0 0.0 0.0 1.0
 probe rgba 220 62 0.0 1.0 0.0 1.0
-probe rgba 125 62 0.5 0.5 0.0 1.0
+probe rgba 125 62 0.4375 0.5625 0.0 1.0
 probe rgba 220 187 1.0 1.0 1.0 1.0
