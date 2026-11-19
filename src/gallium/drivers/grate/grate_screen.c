@@ -110,7 +110,7 @@ grate_init_screen_caps(struct pipe_screen *pscreen)
 
    caps->clear_scissored = true;
    caps->npot_textures = true; /* not really, but mesa requires it for now! */
-   caps->max_render_targets = 8; /* ??? */
+   caps->max_render_targets = 1; /* the fragment compiler writes one colour */
    caps->max_texture_2d_size = 2048;
    caps->max_texture_3d_levels = 0;
    caps->max_texture_cube_levels = 16; /* ??? */
@@ -206,7 +206,7 @@ grate_init_shader_caps(struct pipe_screen *pscreen)
    caps->supported_irs = (1 << PIPE_SHADER_IR_NIR) | (1 << PIPE_SHADER_IR_TGSI);
 }
 
-/* What the state tracker lowers before grate turns NIR into TGSI. */
+/* What the state tracker lowers before grate compiles the NIR. */
 static const nir_shader_compiler_options grate_nir_options = {
    .fuse_ffma32 = true,
    .lower_bitops = true,
