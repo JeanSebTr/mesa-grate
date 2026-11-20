@@ -3381,5 +3381,14 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
       if (ok)
          return true;
    }
+
+   /* nothing fits: draw nothing (Gallium can't fail a shader), as compile()
+    * does for a shader it can't handle at all */
+   struct comp c = { .nir = s, .rows = 1 };
+   segment_begin(&c, &fps[0]);
+   fps[0].info.inputs[0].src = LINK_SRC(0);
+   fps[0].info.num_inputs = 1;
+   new_batch(&c);
+   *num_segments = 1;
    return false;
 }
