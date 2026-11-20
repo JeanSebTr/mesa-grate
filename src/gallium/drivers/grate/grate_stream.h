@@ -28,6 +28,7 @@
 #ifndef GRATE_STREAM_H_
 #define GRATE_STREAM_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "class_ids.h"
@@ -101,6 +102,10 @@ grate_stream_end(struct grate_stream *stream);
 
 int
 grate_stream_flush(struct grate_stream *stream);
+
+bool
+grate_stream_references(const struct grate_stream *stream,
+                        const struct drm_tegra_bo *bo);
 
 int
 grate_stream_push(struct grate_stream *stream, uint32_t word);

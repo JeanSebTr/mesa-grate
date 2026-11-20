@@ -143,6 +143,19 @@ cleanup:
    return result;
 }
 
+/* the job being built or pending references bo */
+bool
+grate_stream_references(const struct grate_stream *stream,
+                        const struct drm_tegra_bo *bo)
+{
+   if (stream->status == GRATE_STREAM_FREE)
+      return false;
+   for (unsigned i = 0; i < stream->num_bos; i++)
+      if (stream->bos[i] == bo)
+         return true;
+   return false;
+}
+
 /*
  * Append to the pending (ended, not yet submitted) job, or start a new one.
  */
