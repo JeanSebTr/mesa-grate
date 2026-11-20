@@ -3705,6 +3705,141 @@ grate_nir_fs_lower(nir_shader *s)
  * Then the same orders again, spilling to render targets when registers
  * run out.
  */
+/*
+ * A chain of adds, multiplies and negations on one per-pixel value x with
+ * uniform operands is x * A + B, A and B uniform: one MAD, with A and B
+ * computed at draw time. E.g. Skia's sk_FragCoord.y is a y flip on top of
+ * the window-system one, then a rect corner is subtracted: four ALU ops
+ * that become one.
+ */
+struct affine {
+   nir_scalar x;   /* the per-pixel value, when has_x */
+   bool has_x;
+   nir_def *a;     /* x's factor (NULL: 1), when has_x */
+   nir_def *b;     /* the uniform term (NULL: 0) */
+   int ops;        /* per-pixel ALU ops it takes now */
+};
+
+/* the passes after this one read divergence: what is built here is uniform */
+static nir_def *
+unif(nir_def *d)
+{
+   d->divergent = false;
+   return d;
+}
+
+static nir_def *
+aff_one(nir_builder *b, nir_def *a)
+{
+   return a ? a : unif(nir_imm_float(b, 1.0f));
+}
+
+static nir_def *
+aff_add(nir_builder *b, nir_def *x, nir_def *y)
+{
+   return !x ? y : !y ? x : unif(nir_fadd(b, x, y));
+}
+
+static bool
+affine_of(nir_builder *b, nir_scalar s, struct affine *r, int depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def->bit_size != 32)
+      return false;
+   if (!s.def->divergent) {
+      *r = (struct affine) { .b = unif(nir_mov_scalar(b, s)) };
+      return true;
+   }
+   *r = (struct affine) { .x = s, .has_x = true };
+   if (depth > 8 || !nir_scalar_is_alu(s))
+      return true;
+   nir_op op = nir_scalar_alu_op(s);
+   if (op != nir_op_fneg && op != nir_op_fadd && op != nir_op_fmul &&
+       op != nir_op_ffma)
+      return true;
+
+   struct affine p[3];
+   for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++)
+      if (!affine_of(b, nir_scalar_chase_alu_src(s, i), &p[i], depth + 1))
+         return true;
+
+   struct affine t;
+   if (op == nir_op_fneg) {
+      t = p[0];
+      if (t.has_x)
+         t.a = unif(nir_fneg(b, aff_one(b, t.a)));
+      if (t.b)
+         t.b = unif(nir_fneg(b, t.b));
+      *r = t;
+      return true;
+   }
+   if (op == nir_op_fmul || op == nir_op_ffma) {
+      /* one factor must be uniform, and not 0 by omission */
+      int u = !p[0].has_x ? 0 : !p[1].has_x ? 1 : -1;
+      if (u < 0 || !p[u].b)
+         return true;
+      t = p[1 - u];
+      if (t.has_x)
+         t.a = t.a ? unif(nir_fmul(b, t.a, p[u].b)) : p[u].b;
+      if (t.b)
+         t.b = unif(nir_fmul(b, t.b, p[u].b));
+      t.ops += t.has_x;
+      if (op == nir_op_fmul) {
+         *r = t;
+         return true;
+      }
+      p[0] = t;
+      p[1] = p[2];
+   }
+   /* a sum (or the add of a ffma, which costs nothing more) */
+   if (p[0].has_x && p[1].has_x &&
+       (p[0].x.def != p[1].x.def || p[0].x.comp != p[1].x.comp))
+      return true;
+   t.has_x = p[0].has_x || p[1].has_x;
+   t.x = p[0].has_x ? p[0].x : p[1].x;
+   if (p[0].has_x && p[1].has_x)
+      t.a = unif(nir_fadd(b, aff_one(b, p[0].a), aff_one(b, p[1].a)));
+   else
+      t.a = p[0].has_x ? p[0].a : p[1].a;
+   t.b = aff_add(b, p[0].b, p[1].b);
+   t.ops = p[0].ops + p[1].ops + (op == nir_op_fadd);
+   *r = t;
+   return true;
+}
+
+static bool
+collapse_affine(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_fadd && alu->op != nir_op_fmul &&
+        alu->op != nir_op_ffma) ||
+       alu->def.num_components != 1 || !alu->def.divergent)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   struct affine t;
+   if (!affine_of(b, nir_get_scalar(&alu->def, 0), &t, 0) || !t.has_x ||
+       t.ops < 2)
+      return false;
+   nir_def *x = nir_mov_scalar(b, t.x);
+   nir_def *v = !t.a ? (t.b ? nir_fadd(b, x, t.b) : x) :
+                !t.b ? nir_fmul(b, x, t.a) : nir_ffma(b, x, t.a, t.b);
+   x->divergent = v->divergent = true;
+   nir_def_replace(&alu->def, v);
+   return true;
+}
+
+static void
+collapse_affine_chains(nir_shader *s)
+{
+   nir_foreach_function_impl(impl, s)
+      nir_metadata_require(impl, nir_metadata_divergence);
+   NIR_PASS(_, s, nir_shader_alu_pass, collapse_affine,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, s, nir_opt_constant_folding);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+}
+
 /* time to draw a pixel, and a full-screen pass costs as much as a few */
 static int
 program_cost(struct grate_fp_shader *fps, int n)
@@ -3729,6 +3864,12 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
 {
    const nir_schedule_options sched = { .threshold = 4, .fallback = true };
    nir_shader *v = nir_shader_clone(NULL, s);
+   /* orders 6-11: 0-5 on collapsed affine chains (more uniforms, which a
+    * tight shader may not fit) */
+   if (order >= 6) {
+      collapse_affine_chains(v);
+      order -= 6;
+   }
    if (order == 5) {
       /* texture coordinates as affine sums: their uniform parts computed at
        * draw time, the rest recomputed at each lookup, x and y side by side */
@@ -3803,7 +3944,7 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    /* one pass, then several, each with every order: the cheapest wins */
    for (int i = -1; i < (int)ARRAY_SIZE(cuts); i++) {
       bool fit = false;
-      for (int order = 0; order < 6; order++) {
+      for (int order = 0; order < 12; order++) {
          struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
          int n = 0;
          if (!try_compile(alt, &n, s, blended, order, true, chain, rows,
@@ -3835,7 +3976,7 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    for (int chain = 1; chain >= 0; chain--) {
       /* every order that fits: the cheapest wins */
       bool fit = false;
-      for (int order = 0; order < 6; order++) {
+      for (int order = 0; order < 12; order++) {
          struct grate_fp_shader alt[1];
          int n = 0;
          if (try_compile(alt, &n, s, blended, order, false, chain, 1, 1, INT_MAX,
