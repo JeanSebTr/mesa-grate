@@ -366,6 +366,21 @@ fail(struct comp *c, const char *msg)
 /* ------------------------------------------------------------------ */
 /* uniform table */
 
+/*
+ * Until embed_immediates() and pack_weights() bring it down to 32, the table
+ * may grow past 32 entries, read as operands 64 and up: entries 40 and 41
+ * would be the fragment position's operands (REG_POS_X/Y). Keep them unused
+ * (an entry no key matches), so an operand is one or the other.
+ */
+#define UNIFORM_POS_HOLE 0xffffffffu
+
+static bool
+is_uniform_operand(int index, int num_uniforms)
+{
+   return index >= REG_UNIFORM && index - REG_UNIFORM < num_uniforms &&
+          index != REG_POS_X && index != REG_POS_Y;
+}
+
 static int
 uniform_slot(struct comp *c, uint32_t key)
 {
@@ -373,6 +388,9 @@ uniform_slot(struct comp *c, uint32_t key)
    for (int i = 0; i < info->num_uniforms; i++)
       if (info->uniforms[i] == key)
          return i;
+   while (info->num_uniforms == REG_POS_X - REG_UNIFORM ||
+          info->num_uniforms == REG_POS_Y - REG_UNIFORM)
+      info->uniforms[info->num_uniforms++] = UNIFORM_POS_HOLE;
    if (info->num_uniforms >= (int)ARRAY_SIZE(info->uniforms)) {
       fail(c, "too many fragment uniforms and immediates");
       return 0;
@@ -2463,7 +2481,7 @@ pack_weights(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_instr *a = &p->slots[s];
             int k = a->src[o].index - REG_UNIFORM;
-            if (k < 0 || k >= n)
+            if (!is_uniform_operand(a->src[o].index, n))
                continue;
             /* a multiplicand (A or B) whose partner is fx10 */
             if (o > 1 || a->op != FP_ALU_OP_MAD ||
@@ -2508,7 +2526,7 @@ pack_weights(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k < 0 || k >= n)
+            if (!is_uniform_operand(op->index, n))
                continue;
             op->index = REG_UNIFORM + remap[k];
             if (half[k] >= 0) {
@@ -2541,7 +2559,8 @@ embed_immediates(struct comp *c)
          for (int o = 0; o < 3; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k < 0 || k >= info->num_uniforms || op->datatype != FP_DATATYPE_FP20 ||
+            if (!is_uniform_operand(op->index, info->num_uniforms) ||
+                op->datatype != FP_DATATYPE_FP20 ||
                 GRATE_FP_UNIFORM_KIND(info->uniforms[k]) != GRATE_FP_UNIFORM_KIND_IMM)
                continue;
             if (slot_of[k] < 0) {
@@ -2564,7 +2583,7 @@ embed_immediates(struct comp *c)
       for (int s = 0; s < (p->has_imm ? 3 : 4); s++)
          for (int o = 0; o < 4; o++) {
             int k = p->slots[s].src[o].index - REG_UNIFORM;
-            if (k >= 0 && k < info->num_uniforms)
+            if (is_uniform_operand(p->slots[s].src[o].index, info->num_uniforms))
                used[k] = true;
          }
    int n = 0;
@@ -2578,7 +2597,7 @@ embed_immediates(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k >= 0 && k < info->num_uniforms)
+            if (is_uniform_operand(op->index, info->num_uniforms))
                op->index = REG_UNIFORM + remap[k];
          }
    info->num_uniforms = n;
