@@ -184,13 +184,44 @@ is_sfu_op(nir_op op)
           op == nir_op_flog2 || op == nir_op_fexp2 || op == nir_op_ffract;
 }
 
+/*
+ * An op whose one user is fsat writes its result saturated (the destination
+ * modifier), and the fsat is a copy.
+ */
+static bool
+sat_fused(nir_alu_instr *alu)
+{
+   if ((alu->op != nir_op_fadd && alu->op != nir_op_fmul &&
+        alu->op != nir_op_ffma && alu->op != nir_op_fmin &&
+        alu->op != nir_op_fmax) ||
+       alu->def.num_components != 1 || alu->def.bit_size != 32 ||
+       !list_is_singular(&alu->def.uses))
+      return false;
+   nir_src *u = list_first_entry(&alu->def.uses, nir_src, use_link);
+   if (nir_src_is_if(u))
+      return false;
+   nir_instr *i = nir_src_parent_instr(u);
+   return i->type == nir_instr_type_alu &&
+          nir_instr_as_alu(i)->op == nir_op_fsat &&
+          nir_instr_as_alu(i)->def.num_components == 1;
+}
+
+static bool
+is_fused_fsat(nir_alu_instr *alu)
+{
+   if (alu->op != nir_op_fsat)
+      return false;
+   nir_instr *si = nir_def_instr(alu->src[0].src.ssa);
+   return si->type == nir_instr_type_alu && sat_fused(nir_instr_as_alu(si));
+}
+
 static bool
 is_copy(nir_instr *instr)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(instr);
-   if (nir_op_is_vec_or_mov(alu->op))
+   if (nir_op_is_vec_or_mov(alu->op) || is_fused_fsat(alu))
       return true;
    /* fneg/fabs whose users are all plain ALU ops become source modifiers */
    if (alu->op != nir_op_fneg && alu->op != nir_op_fabs)
@@ -222,6 +253,8 @@ chase(nir_scalar s, bool *negate, bool *absolute)
          if (absolute) *absolute = true;
       } else if (alu->op == nir_op_fneg) {
          if (negate && !(absolute && *absolute)) *negate = !*negate;
+      } else if (alu->op == nir_op_fsat) {
+         /* fused: the source holds the saturated value */
       } else {
          return s;
       }
@@ -1856,6 +1889,8 @@ fold_uniform(struct comp *c, nir_alu_instr *alu, unsigned ch, struct val *dst)
          return false;
    }
    uint32_t key = expr_key(c, ops[k].op, src[0], src[1], src[2]);
+   if (key && sat_fused(alu))
+      key = expr_key(c, GRATE_FP_EXPR_SAT, key, 0, 0);
    if (!key)
       return false;
    /* a table entry only where an instruction reads it, see operand() */
@@ -1928,23 +1963,23 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
          break;
       case nir_op_fadd:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fmul:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch),
-                  use(c, alu, 1, ch), zero, false);
+                  use(c, alu, 1, ch), zero, sat_fused(alu));
          break;
       case nir_op_ffma:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch),
-                  use(c, alu, 1, ch), use(c, alu, 2, ch), false);
+                  use(c, alu, 1, ch), use(c, alu, 2, ch), sat_fused(alu));
          break;
       case nir_op_fmin:
          emit_mad(c, dst, FP_ALU_OP_MIN, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fmax:
          emit_mad(c, dst, FP_ALU_OP_MAX, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fcsel:
          /* (-cond < 0) ? a : b, cond is 1.0 or 0.0 */
