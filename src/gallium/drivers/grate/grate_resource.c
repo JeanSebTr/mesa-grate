@@ -109,7 +109,10 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    if (!ptrans)
       return NULL;
 
-   grate_flush_3d(context);
+   /* the pending 3D job reads or writes it: run it first */
+   if (!(usage & PIPE_MAP_UNSYNCHRONIZED) &&
+       grate_stream_references(&context->gr3d->stream, resource->bo))
+      grate_flush_3d(context);
 
    if (drm_tegra_bo_map(resource->bo, &ret))
       return NULL;
@@ -324,7 +327,10 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
    dst = grate_resource(info->dst.resource);
    src = grate_resource(info->src.resource);
 
-   grate_flush_3d(gr2d->context);
+   /* 2D jobs run at once: the pending 3D job first if it uses either */
+   struct grate_stream *s3d = &gr2d->context->gr3d->stream;
+   if (grate_stream_references(s3d, dst->bo) || grate_stream_references(s3d, src->bo))
+      grate_flush_3d(gr2d->context);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
@@ -413,7 +419,9 @@ fill(struct grate_channel *gr2d,
    uint32_t value;
    int err;
 
-   grate_flush_3d(gr2d->context);
+   /* 2D jobs run at once: the pending 3D job first if it uses dst */
+   if (grate_stream_references(&gr2d->context->gr3d->stream, dst->bo))
+      grate_flush_3d(gr2d->context);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
