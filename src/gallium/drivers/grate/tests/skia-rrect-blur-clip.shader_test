@@ -1,0 +1,73 @@
+# Skia (GL backend) analytic blurred rounded rect under a rounded-rect clip-out
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+attribute vec4 piglit_vertex;
+varying mediump vec4 vcolor_S0;
+void main()
+{
+	gl_Position = piglit_vertex;
+	vcolor_S0 = vec4(1.0, 0.5, 0.0, 1.0);
+}
+
+[fragment shader]
+#version 100
+uniform highp vec2 u_skRTFlip;
+precision mediump float;
+precision mediump sampler2D;
+uniform highp mat3 umatrix_S1_c0_c0;
+uniform mediump float ucornerRadius_S1_c0;
+uniform highp vec4 uproxyRect_S1_c0;
+uniform mediump float ublurRadius_S1_c0;
+uniform highp vec4 uinnerRect_S2;
+uniform mediump vec2 uradiusPlusHalf_S2;
+uniform sampler2D uTextureSampler_0_S1;
+varying mediump vec4 vcolor_S0;
+void main() {
+highp     vec4 sk_FragCoord = vec4(gl_FragCoord.x, u_skRTFlip.x + u_skRTFlip.y * gl_FragCoord.y, gl_FragCoord.z, gl_FragCoord.w);
+mediump vec4 outputColor_S0 = vcolor_S0;
+highp vec2 _9_translatedFragPosFloat = sk_FragCoord.xy - uproxyRect_S1_c0.xy;
+highp vec2 _10_proxyCenter = (uproxyRect_S1_c0.zw - uproxyRect_S1_c0.xy) * 0.5;
+mediump float _11_edgeSize = (2.0 * ublurRadius_S1_c0 + ucornerRadius_S1_c0) + 0.5;
+_9_translatedFragPosFloat -= _10_proxyCenter;
+mediump vec2 _12_fragDirection = sign(_9_translatedFragPosFloat);
+_9_translatedFragPosFloat = abs(_9_translatedFragPosFloat);
+mediump vec2 _13_translatedFragPosHalf = _9_translatedFragPosFloat - (_10_proxyCenter - _11_edgeSize);
+_13_translatedFragPosHalf = max(_13_translatedFragPosHalf, 0.0);
+_13_translatedFragPosHalf *= _12_fragDirection;
+_13_translatedFragPosHalf += vec2(_11_edgeSize);
+mediump vec2 _14_proxyDims = vec2(2.0 * _11_edgeSize);
+mediump vec2 _15_texCoord = _13_translatedFragPosHalf / _14_proxyDims;
+mediump vec4 output_S1 = texture2D(uTextureSampler_0_S1, (umatrix_S1_c0_c0 * vec3(_15_texCoord, 1.0)).xy).wwww;
+highp vec2 _16_dxy0 = uinnerRect_S2.xy - sk_FragCoord.xy;
+highp vec2 _17_dxy1 = sk_FragCoord.xy - uinnerRect_S2.zw;
+highp vec2 _18_dxy = max(max(_16_dxy0, _17_dxy1), 0.0);
+mediump float _19_alpha = clamp(uradiusPlusHalf_S2.x - length(_18_dxy), 0.0, 1.0);
+_19_alpha = 1.0 - _19_alpha;
+mediump vec4 output_S2 = output_S1 * _19_alpha;
+{
+gl_FragColor = outputColor_S0 * output_S2;
+}
+}
+
+[test]
+texture rgbw 0 (8, 8)
+uniform int uTextureSampler_0_S1 0
+uniform vec2 u_skRTFlip 0.0 1.0
+uniform mat3 umatrix_S1_c0_c0 1.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0 1.0
+uniform float ucornerRadius_S1_c0 16.0
+uniform vec4 uproxyRect_S1_c0 0.0 0.0 250.0 250.0
+uniform float ublurRadius_S1_c0 7.5
+uniform vec4 uinnerRect_S2 100.0 100.0 150.0 150.0
+uniform vec2 uradiusPlusHalf_S2 10.5 10.5
+clear color 0.0 0.0 0.0 0.0
+clear
+draw rect -1 -1 2 2
+probe rgba 10 10 1.0 0.5 0.0 1.0
+probe rgba 240 30 1.0 0.5 0.0 1.0
+probe rgba 125 125 0.0 0.0 0.0 0.0
+probe rgba 125 60 1.0 0.5 0.0 1.0
+probe rgba 60 200 1.0 0.5 0.0 1.0

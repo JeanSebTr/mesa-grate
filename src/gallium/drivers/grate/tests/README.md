@@ -26,7 +26,9 @@ doesn't have yet: `shader_runner-blend.patch` adds `enable GL_BLEND` and
   rounded-rect clip, gaussian blur, and the blur with decal edges,
   quadratic-edge coverage with derivatives, a multi-stop gradient);
   `skia-aa-quad-vs` and `skia-gradient` use Skia's vertex shader and
-  attribute layout too.
+  attribute layout too. `skia-rrect-blur-clip*`: an analytic blurred
+  rounded rect under a rounded-rect clip-out, alone and blended: enough
+  uniforms to fill the table past its 41st entry, with `gl_FragCoord`.
 
 Avoid running untested programs while a compositor is drawing: a bad
 program can hang GR3D, and only a reboot clears that.
