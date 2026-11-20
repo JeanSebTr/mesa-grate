@@ -1693,6 +1693,14 @@ use(struct comp *c, nir_alu_instr *alu, int s, unsigned chan)
    return op;
 }
 
+static bool
+alu_src_is_zero(nir_alu_instr *alu, int s, unsigned chan)
+{
+   nir_scalar sc = nir_scalar_chase_movs(nir_get_scalar(alu->src[s].src.ssa,
+                                                        alu->src[s].swizzle[chan]));
+   return nir_scalar_is_const(sc) && nir_scalar_as_float(sc) == 0.0f;
+}
+
 static struct fp_alu_src_operand
 neg(struct fp_alu_src_operand s)
 {
@@ -1951,16 +1959,36 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
          emit_mad(c, dst, FP_ALU_OP_CSEL, neg(use(c, alu, 0, ch)),
                   use(c, alu, 1, ch), use(c, alu, 2, ch), false);
          break;
+      case nir_op_fsign: {
+         /* x < 0 ? -1 : 0, then -x < 0 ? 1 : that */
+         struct val t = new_row_val(c);
+         struct fp_alu_src_operand x = use(c, alu, 0, ch);
+         emit_mad(c, &t, FP_ALU_OP_CSEL, x, neg(one), zero, false);
+         note_use(c, &t);
+         emit_mad(c, dst, FP_ALU_OP_CSEL, neg(use(c, alu, 0, ch)), one,
+                  operand(c, &t), false);
+         t.last = c->num_batches;
+         release(c, &t);
+         break;
+      }
       case nir_op_slt:
       case nir_op_sge:
       case nir_op_seq:
       case nir_op_sne: {
-         /* t = a - b, then select on its sign */
-         struct val t = new_row_val(c);
-         emit_mad(c, &t, FP_ALU_OP_MAD, use(c, alu, 0, ch), one,
-                  neg(use(c, alu, 1, ch)), false);
-         note_use(c, &t);
-         struct fp_alu_src_operand ts = operand(c, &t);
+         /* t = a - b, then select on its sign; against 0.0, a or -b */
+         struct val t = { .kind = VAL_NONE };
+         struct fp_alu_src_operand ts;
+         if (alu_src_is_zero(alu, 1, ch)) {
+            ts = use(c, alu, 0, ch);
+         } else if (alu_src_is_zero(alu, 0, ch)) {
+            ts = neg(use(c, alu, 1, ch));
+         } else {
+            t = new_row_val(c);
+            emit_mad(c, &t, FP_ALU_OP_MAD, use(c, alu, 0, ch), one,
+                     neg(use(c, alu, 1, ch)), false);
+            note_use(c, &t);
+            ts = operand(c, &t);
+         }
          switch (alu->op) {
          case nir_op_slt: /* t < 0 ? 1 : 0 */
             emit_mad(c, dst, FP_ALU_OP_CSEL, ts, one, zero, false);
@@ -1975,8 +2003,10 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
             emit_mad(c, dst, FP_ALU_OP_CSEL, neg(abs_(ts)), one, zero, false);
             break;
          }
-         t.last = c->num_batches;
-         release(c, &t);
+         if (t.kind == VAL_ROW) {
+            t.last = c->num_batches;
+            release(c, &t);
+         }
          break;
       }
       case nir_op_frcp:

@@ -214,7 +214,6 @@ static const nir_shader_compiler_options grate_nir_options = {
    .lower_extract_word = true,
    .lower_fdiv = true,
    .lower_fsat = true,
-   .lower_fsign = true,
    .lower_insert_byte = true,
    .lower_insert_word = true,
    .lower_fdph = true,
