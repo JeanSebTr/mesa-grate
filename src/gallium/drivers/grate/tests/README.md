@@ -26,7 +26,7 @@ doesn't have yet: `shader_runner-blend.patch` adds `enable GL_BLEND` and
   rounded-rect clip, gaussian blur, and the blur with decal edges,
   quadratic-edge coverage with derivatives, a multi-stop gradient);
   `skia-aa-quad-vs` and `skia-gradient` use Skia's vertex shader and
-  attribute layout too. `skia-gradient-grid`: the gradient probed on a 20 px grid, 133 points. `skia-rrect-blur-clip*`: an analytic blurred
+  attribute layout too. `skia-gradient-grid`: the gradient probed on a 20 px grid, 133 points; `skia-gradient-blend`: the same, translucent and blended src-over (a blended multi-pass 4-row program). `skia-rrect-blur-clip*`: an analytic blurred
   rounded rect under a rounded-rect clip-out, alone and blended: enough
   uniforms to fill the table past its 41st entry, with `gl_FragCoord`.
 
