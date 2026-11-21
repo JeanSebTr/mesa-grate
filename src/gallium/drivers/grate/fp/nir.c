@@ -1709,7 +1709,9 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    slot->src[3] = lowp(true);
 
    /* what the next packet can read as ALU result register 24 + k: not a
-    * saturated result (the register may hold it unclamped) */
+    * saturated result (the register may hold it unclamped), and not one
+    * written to a single fx10 half (the result register then reads 0 on
+    * the hardware) */
    c->pkt_slot_row[k] = (struct fp_alu_src_operand) { .index = 255 };
    if (dst->index < 16) {
       c->pkt_rows_written |= 1u << dst->index;
@@ -1717,7 +1719,7 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
       dst->pkt = c->pkt;
       dst->slot = k;
       dst->def = c->num_batches - 1;
-      if (!sat)
+      if (!sat && !dst->fx10)
          c->pkt_slot_row[k] = (struct fp_alu_src_operand) {
             .index = dst->index,
             .datatype = dst->fx10 ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20,
