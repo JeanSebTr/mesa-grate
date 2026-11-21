@@ -2785,6 +2785,17 @@ track_active(struct comp *c, nir_instr *instr)
          c->act[c->nact++] = def->index * NIR_MAX_VEC_COMPONENTS + k;
 }
 
+/* a pass that computes something (else ending it would add an empty pass) */
+static bool
+pass_has_work(struct grate_fp_shader *fp)
+{
+   list_for_each_entry(struct fp_alu_instr_packet, p, &fp->alu_instructions, link)
+      for (int k = 0; k < 4; k++)
+         if (!slot_is_nop(&p->slots[k]))
+            return true;
+   return false;
+}
+
 /*
  * Compile into up to max_segments programs (passes). A pass ends once it
  * holds `cut` batches or `ucut` uniforms: what's live then goes to spill
@@ -2835,7 +2846,7 @@ compile(struct grate_fp_shader *fps, int max_segments, int cut, int ucut,
 
          /* a full pass: hand over to the next one */
          if (seg + 1 < max_segments && !is_copy(instr) &&
-             instr->type != nir_instr_type_load_const &&
+             instr->type != nir_instr_type_load_const && pass_has_work(c.fp) &&
              (c.num_batches >= cut || c.fp->info.num_uniforms >= ucut)) {
             spill_all(&c);
             segment_end(&c, false);
@@ -3798,7 +3809,9 @@ grate_nir_fs_lower(nir_shader *s)
  *  3. 1 then 2;
  *  4. a greedy order that frees registers first (reorder_pressure());
  *  5. texture coordinates regrouped as affine sums (blurs, see
- *     interleave_coords()).
+ *     interleave_coords());
+ *  6. NIR's order through nir_schedule's parallelism mode;
+ *  7. 1 then 6.
  * Then the same orders again, spilling to render targets when registers
  * run out.
  */
@@ -3954,18 +3967,25 @@ program_cost(struct grate_fp_shader *fps, int n)
    return cost;
 }
 
+/* instruction orders tried, each also on collapsed affine chains */
+#define GRATE_FP_ORDERS 8
+
 static bool
 try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
             bool blended, int order, bool spill, bool chain, int rows,
             int max_segments, int cut, const char **error)
 {
-   const nir_schedule_options sched = { .threshold = 4, .fallback = true };
+   const nir_schedule_options pressure = { .threshold = 4, .fallback = true };
+   /* nir_schedule's parallelism mode: independent chains side by side fill
+    * a batch's packets, the threshold keeps pressure near the four row
+    * registers */
+   const nir_schedule_options parallel = { .threshold = 4 };
    nir_shader *v = nir_shader_clone(NULL, s);
-   /* orders 6-11: 0-5 on collapsed affine chains (more uniforms, which a
+   /* orders 8-15: 0-7 on collapsed affine chains (more uniforms, which a
     * tight shader may not fit) */
-   if (order >= 6) {
+   if (order >= GRATE_FP_ORDERS) {
       collapse_affine_chains(v);
-      order -= 6;
+      order -= GRATE_FP_ORDERS;
    }
    if (order == 5) {
       /* texture coordinates as affine sums: their uniform parts computed at
@@ -3989,7 +4009,7 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
          NIR_PASS(_, v, reorder_depth_first);
       }
       if (order & 2)
-         NIR_PASS(_, v, nir_schedule, &sched);
+         NIR_PASS(_, v, nir_schedule, order >= 6 ? &parallel : &pressure);
    }
    bool ok = compile(fps, max_segments, cut, 28, num_segments, v, spill, chain,
                      rows, blended, error);
@@ -4041,7 +4061,7 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    /* one pass, then several, each with every order: the cheapest wins */
    for (int i = -1; i < (int)ARRAY_SIZE(cuts); i++) {
       bool fit = false;
-      for (int order = 0; order < 12; order++) {
+      for (int order = 0; order < 2 * GRATE_FP_ORDERS; order++) {
          struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
          int n = 0;
          if (!try_compile(alt, &n, s, blended, order, true, chain, rows,
@@ -4073,7 +4093,7 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    for (int chain = 1; chain >= 0; chain--) {
       /* every order that fits: the cheapest wins */
       bool fit = false;
-      for (int order = 0; order < 12; order++) {
+      for (int order = 0; order < 2 * GRATE_FP_ORDERS; order++) {
          struct grate_fp_shader alt[1];
          int n = 0;
          if (try_compile(alt, &n, s, blended, order, false, chain, 1, 1, INT_MAX,
