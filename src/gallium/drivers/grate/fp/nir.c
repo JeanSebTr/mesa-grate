@@ -2177,12 +2177,15 @@ emit_intrinsic(struct comp *c, nir_intrinsic_instr *intr)
        */
       c->pkt = NULL;
       c->store_packet = true;
+      int written = -1; /* the last batch that wrote R2-R3 */
       for (unsigned k = 0; k < n; k++) {
          unsigned cc = first + k;
          struct val *s = src_val(c, intr->src[0], k);
          note_use(c, s);
-         if (at_output(s, cc))
+         if (at_output(s, cc)) {
+            written = MAX2(written, s->def);
             continue;
+         }
          struct val out = {
             .kind = VAL_ROW, .index = out_reg[cc], .fx10 = true,
             .high = out_high[cc],
@@ -2192,9 +2195,14 @@ emit_intrinsic(struct comp *c, nir_intrinsic_instr *intr)
           * the allocator keeps outputs last, see compile(). */
          emit_mad(c, &out, FP_ALU_OP_MAD, operand(c, s), lowp(true), lowp(false),
                   false);
+         written = c->num_batches - 1;
       }
       c->store_packet = false;
+      /* a DW that sees the colour: with several rows, not in a batch that
+       * writes it, unless the last of a round (see seen_in()) */
       struct fp_instr *dw = batch_for(c, 4);
+      while (written >= 0 && !seen_in(c, written, c->num_batches - 1))
+         dw = new_io_batch(c);
       dw->dw.enable = 1;
       c->touched |= 0xc;
       dw->dw.index = 1;
