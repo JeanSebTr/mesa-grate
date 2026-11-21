@@ -844,7 +844,12 @@ spill_regs(struct comp *c, int lo, unsigned mask)
              k != slot_of[0])
             slot = k;
       if (slot < 0) {
-         if (c->num_slots == MAX_SPILL_SLOTS) {
+         /*
+          * With four rows, the last slot (render target 11) loses what it
+          * stores on the hardware: a 4-row Skia gradient drew wrong colours
+          * whenever it used it, right with 2 rows or 7 slots.
+          */
+         if (c->num_slots == (c->rows == 4 ? MAX_SPILL_SLOTS - 1 : MAX_SPILL_SLOTS)) {
             fail(c, "out of spill slots");
             return false;
          }
