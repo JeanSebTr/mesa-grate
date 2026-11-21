@@ -1063,11 +1063,12 @@ static void reload_values(struct comp *c, int slot, int q);
 /*
  * With several rows, the PSEQ of batch k reads a slot back into a pair of
  * row k % rows: take a free pair on the current batch's row or on one of
- * the next batches', instead of padding to a batch on row 0. Only rows 0
- * and the last: with the PSEQ on the middle rows of four, a three-pass
- * gradient comes out wrong on the hardware (not understood yet). The pair
- * mustn't have an ALU write earlier in the same round, which would land
- * after the PSEQ.
+ * the next batches', instead of padding to a batch on row 0. The PSEQ
+ * loads of a round all land at its start (measured: the ALU of a round's
+ * first batch already reads what its last batch's PSEQ loads), so the pair
+ * must be untouched since the round began: no read (which would get the
+ * reloaded value instead of the old one) and no ALU write (which would
+ * land after it). Only rows 0 and the last, as before.
  */
 static bool
 reload_other_row(struct comp *c, int slot)
@@ -1084,7 +1085,7 @@ reload_other_row(struct comp *c, int slot)
          for (int h = 0; h < 2; h++) {
             int r = q + h;
             ok &= r != 4; /* the interpolation setup reads r4 */
-            ok &= c->reg_busy_until[r] <= c->num_batches;
+            ok &= c->reg_busy_until[r] < round;
             ok &= c->alu_write_batch[r] < round;
             ok &= !(ahead == 0 && (c->touched & (1u << r)));
          }
