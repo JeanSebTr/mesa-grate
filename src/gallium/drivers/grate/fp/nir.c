@@ -184,13 +184,44 @@ is_sfu_op(nir_op op)
           op == nir_op_flog2 || op == nir_op_fexp2 || op == nir_op_ffract;
 }
 
+/*
+ * An op whose one user is fsat writes its result saturated (the destination
+ * modifier), and the fsat is a copy.
+ */
+static bool
+sat_fused(nir_alu_instr *alu)
+{
+   if ((alu->op != nir_op_fadd && alu->op != nir_op_fmul &&
+        alu->op != nir_op_ffma && alu->op != nir_op_fmin &&
+        alu->op != nir_op_fmax) ||
+       alu->def.num_components != 1 || alu->def.bit_size != 32 ||
+       !list_is_singular(&alu->def.uses))
+      return false;
+   nir_src *u = list_first_entry(&alu->def.uses, nir_src, use_link);
+   if (nir_src_is_if(u))
+      return false;
+   nir_instr *i = nir_src_parent_instr(u);
+   return i->type == nir_instr_type_alu &&
+          nir_instr_as_alu(i)->op == nir_op_fsat &&
+          nir_instr_as_alu(i)->def.num_components == 1;
+}
+
+static bool
+is_fused_fsat(nir_alu_instr *alu)
+{
+   if (alu->op != nir_op_fsat)
+      return false;
+   nir_instr *si = nir_def_instr(alu->src[0].src.ssa);
+   return si->type == nir_instr_type_alu && sat_fused(nir_instr_as_alu(si));
+}
+
 static bool
 is_copy(nir_instr *instr)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
    nir_alu_instr *alu = nir_instr_as_alu(instr);
-   if (nir_op_is_vec_or_mov(alu->op))
+   if (nir_op_is_vec_or_mov(alu->op) || is_fused_fsat(alu))
       return true;
    /* fneg/fabs whose users are all plain ALU ops become source modifiers */
    if (alu->op != nir_op_fneg && alu->op != nir_op_fabs)
@@ -222,6 +253,8 @@ chase(nir_scalar s, bool *negate, bool *absolute)
          if (absolute) *absolute = true;
       } else if (alu->op == nir_op_fneg) {
          if (negate && !(absolute && *absolute)) *negate = !*negate;
+      } else if (alu->op == nir_op_fsat) {
+         /* fused: the source holds the saturated value */
       } else {
          return s;
       }
@@ -333,6 +366,21 @@ fail(struct comp *c, const char *msg)
 /* ------------------------------------------------------------------ */
 /* uniform table */
 
+/*
+ * Until embed_immediates() and pack_weights() bring it down to 32, the table
+ * may grow past 32 entries, read as operands 64 and up: entries 40 and 41
+ * would be the fragment position's operands (REG_POS_X/Y). Keep them unused
+ * (an entry no key matches), so an operand is one or the other.
+ */
+#define UNIFORM_POS_HOLE 0xffffffffu
+
+static bool
+is_uniform_operand(int index, int num_uniforms)
+{
+   return index >= REG_UNIFORM && index - REG_UNIFORM < num_uniforms &&
+          index != REG_POS_X && index != REG_POS_Y;
+}
+
 static int
 uniform_slot(struct comp *c, uint32_t key)
 {
@@ -340,6 +388,9 @@ uniform_slot(struct comp *c, uint32_t key)
    for (int i = 0; i < info->num_uniforms; i++)
       if (info->uniforms[i] == key)
          return i;
+   while (info->num_uniforms == REG_POS_X - REG_UNIFORM ||
+          info->num_uniforms == REG_POS_Y - REG_UNIFORM)
+      info->uniforms[info->num_uniforms++] = UNIFORM_POS_HOLE;
    if (info->num_uniforms >= (int)ARRAY_SIZE(info->uniforms)) {
       fail(c, "too many fragment uniforms and immediates");
       return 0;
@@ -1864,6 +1915,8 @@ fold_uniform(struct comp *c, nir_alu_instr *alu, unsigned ch, struct val *dst)
          return false;
    }
    uint32_t key = expr_key(c, ops[k].op, src[0], src[1], src[2]);
+   if (key && sat_fused(alu))
+      key = expr_key(c, GRATE_FP_EXPR_SAT, key, 0, 0);
    if (!key)
       return false;
    /* a table entry only where an instruction reads it, see operand() */
@@ -1936,23 +1989,23 @@ emit_alu(struct comp *c, nir_alu_instr *alu)
          break;
       case nir_op_fadd:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fmul:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch),
-                  use(c, alu, 1, ch), zero, false);
+                  use(c, alu, 1, ch), zero, sat_fused(alu));
          break;
       case nir_op_ffma:
          emit_mad(c, dst, FP_ALU_OP_MAD, use(c, alu, 0, ch),
-                  use(c, alu, 1, ch), use(c, alu, 2, ch), false);
+                  use(c, alu, 1, ch), use(c, alu, 2, ch), sat_fused(alu));
          break;
       case nir_op_fmin:
          emit_mad(c, dst, FP_ALU_OP_MIN, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fmax:
          emit_mad(c, dst, FP_ALU_OP_MAX, use(c, alu, 0, ch), one,
-                  use(c, alu, 1, ch), false);
+                  use(c, alu, 1, ch), sat_fused(alu));
          break;
       case nir_op_fcsel:
          /* (-cond < 0) ? a : b, cond is 1.0 or 0.0 */
@@ -2458,7 +2511,7 @@ pack_weights(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_instr *a = &p->slots[s];
             int k = a->src[o].index - REG_UNIFORM;
-            if (k < 0 || k >= n)
+            if (!is_uniform_operand(a->src[o].index, n))
                continue;
             /* a multiplicand (A or B) whose partner is fx10 */
             if (o > 1 || a->op != FP_ALU_OP_MAD ||
@@ -2503,7 +2556,7 @@ pack_weights(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k < 0 || k >= n)
+            if (!is_uniform_operand(op->index, n))
                continue;
             op->index = REG_UNIFORM + remap[k];
             if (half[k] >= 0) {
@@ -2536,7 +2589,8 @@ embed_immediates(struct comp *c)
          for (int o = 0; o < 3; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k < 0 || k >= info->num_uniforms || op->datatype != FP_DATATYPE_FP20 ||
+            if (!is_uniform_operand(op->index, info->num_uniforms) ||
+                op->datatype != FP_DATATYPE_FP20 ||
                 GRATE_FP_UNIFORM_KIND(info->uniforms[k]) != GRATE_FP_UNIFORM_KIND_IMM)
                continue;
             if (slot_of[k] < 0) {
@@ -2559,7 +2613,7 @@ embed_immediates(struct comp *c)
       for (int s = 0; s < (p->has_imm ? 3 : 4); s++)
          for (int o = 0; o < 4; o++) {
             int k = p->slots[s].src[o].index - REG_UNIFORM;
-            if (k >= 0 && k < info->num_uniforms)
+            if (is_uniform_operand(p->slots[s].src[o].index, info->num_uniforms))
                used[k] = true;
          }
    int n = 0;
@@ -2573,7 +2627,7 @@ embed_immediates(struct comp *c)
          for (int o = 0; o < 4; o++) {
             struct fp_alu_src_operand *op = &p->slots[s].src[o];
             int k = op->index - REG_UNIFORM;
-            if (k >= 0 && k < info->num_uniforms)
+            if (is_uniform_operand(op->index, info->num_uniforms))
                op->index = REG_UNIFORM + remap[k];
          }
    info->num_uniforms = n;
@@ -3182,6 +3236,470 @@ rematerialize_inputs(nir_shader *s)
    return progress;
 }
 
+/* a * b + c as a multiply and an add, for reassociation */
+static bool
+split_ffma(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_ffma)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *r = nir_fadd(b, nir_fmul(b, nir_ssa_for_alu_src(b, alu, 0),
+                                     nir_ssa_for_alu_src(b, alu, 1)),
+                         nir_ssa_for_alu_src(b, alu, 2));
+   nir_def_replace(&alu->def, r);
+   return true;
+}
+
+/*
+ * u * (x + y) = u * x + u * y for a uniform u: products of uniforms become
+ * uniform-only terms (computed at draw time), which reassociation then
+ * gathers, e.g. a matrix times (coordinate + offset * direction).
+ */
+static bool
+distribute_uniform_mul(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_fmul || alu->def.num_components != 1)
+      return false;
+   for (int i = 0; i < 2; i++) {
+      nir_def *u = alu->src[i].src.ssa, *sum = alu->src[1 - i].src.ssa;
+      if (u->divergent)
+         continue;
+      nir_instr *si = nir_def_instr(sum);
+      if (si->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *add = nir_instr_as_alu(si);
+      if (add->op != nir_op_fadd || add->def.num_components != 1)
+         continue;
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *us = nir_ssa_for_alu_src(b, alu, i);
+      nir_def *r = nir_fadd(b, nir_fmul(b, us, nir_ssa_for_alu_src(b, add, 0)),
+                            nir_fmul(b, us, nir_ssa_for_alu_src(b, add, 1)));
+      nir_def_replace(&alu->def, r);
+      return true;
+   }
+   return false;
+}
+
+static bool
+is_fadd_scalar(nir_scalar x)
+{
+   return nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_fadd;
+}
+
+/* a sum is a value of its own if anything but another sum reads it */
+static bool
+is_sum_root(nir_def *def)
+{
+   nir_foreach_use_including_if(u, def) {
+      if (nir_src_is_if(u))
+         return true;
+      nir_instr *ui = nir_src_parent_instr(u);
+      if (ui->type != nir_instr_type_alu || nir_instr_as_alu(ui)->op != nir_op_fadd)
+         return true;
+   }
+   return false;
+}
+
+static void
+sum_leaves(nir_scalar x, nir_scalar *leaves, int *n, int max, bool top)
+{
+   if (is_fadd_scalar(x) && *n < max - 1 && (top || !is_sum_root(x.def))) {
+      sum_leaves(nir_scalar_chase_alu_src(x, 0), leaves, n, max, false);
+      sum_leaves(nir_scalar_chase_alu_src(x, 1), leaves, n, max, false);
+      return;
+   }
+   leaves[(*n)++] = x;
+}
+
+static int
+cmp_scalar(const void *a, const void *b)
+{
+   const nir_scalar *x = a, *y = b;
+   if (x->def->index != y->def->index)
+      return x->def->index < y->def->index ? -1 : 1;
+   return (int)x->comp - (int)y->comp;
+}
+
+/*
+ * A sum of varying and uniform terms as (varying terms, in a fixed order)
+ * + (uniform terms): the first part is the same for every tap of a blur
+ * (one value), the second is computed at draw time.
+ */
+static bool
+regroup_sum(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_fadd || alu->def.num_components != 1)
+      return false;
+   if (!is_sum_root(&alu->def))
+      return false;
+   nir_scalar leaves[16], div[16], uni[16];
+   int n = 0, nd = 0, nu = 0;
+   sum_leaves(nir_get_scalar(&alu->def, 0), leaves, &n, 16, true);
+   for (int i = 0; i < n; i++) {
+      if (leaves[i].def->divergent)
+         div[nd++] = leaves[i];
+      else
+         uni[nu++] = leaves[i];
+   }
+   if (!nd || !nu || n < 3 || nd > 3)
+      return false;
+   qsort(div, nd, sizeof(div[0]), cmp_scalar);
+   qsort(uni, nu, sizeof(uni[0]), cmp_scalar);
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *d = nir_mov_scalar(b, div[0]);
+   for (int i = 1; i < nd; i++) {
+      if (nir_scalar_is_alu(div[i]) && nir_scalar_alu_op(div[i]) == nir_op_fmul)
+         d = nir_ffma(b, nir_mov_scalar(b, nir_scalar_chase_alu_src(div[i], 0)),
+                      nir_mov_scalar(b, nir_scalar_chase_alu_src(div[i], 1)), d);
+      else
+         d = nir_fadd(b, d, nir_mov_scalar(b, div[i]));
+   }
+   nir_def *u = nir_mov_scalar(b, uni[0]);
+   for (int i = 1; i < nu; i++)
+      u = nir_fadd(b, u, nir_mov_scalar(b, uni[i]));
+   nir_def_replace(&alu->def, nir_fadd(b, d, u));
+   return true;
+}
+
+static void
+reassociate_affine(nir_shader *s)
+{
+   NIR_PASS(_, s, nir_shader_alu_pass, split_ffma, nir_metadata_control_flow, NULL);
+   for (int k = 0; k < 4; k++) {
+      nir_foreach_function_impl(impl, s)
+         nir_metadata_require(impl, nir_metadata_divergence);
+      bool p = false;
+      NIR_PASS(p, s, nir_shader_alu_pass, distribute_uniform_mul,
+               nir_metadata_control_flow, NULL);
+      if (!p)
+         break;
+   }
+   nir_foreach_function_impl(impl, s) {
+      nir_metadata_require(impl, nir_metadata_divergence);
+      nir_index_ssa_defs(impl);
+   }
+   NIR_PASS(_, s, nir_shader_alu_pass, regroup_sum, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_constant_folding);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_dce);
+}
+
+/* depth of a value computed from varyings, uniforms and constants only (ALU
+ * ops on loads), -1 otherwise */
+static int
+cheap_depth(nir_def *def, struct hash_table *memo)
+{
+   struct hash_entry *e = _mesa_hash_table_search(memo, def);
+   if (e)
+      return (int)(intptr_t)e->data - 2;
+   nir_instr *instr = nir_def_instr(def);
+   int d = -1;
+   if (instr->type == nir_instr_type_load_const) {
+      d = 0;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_input ||
+          intr->intrinsic == nir_intrinsic_load_interpolated_input ||
+          intr->intrinsic == nir_intrinsic_load_ubo ||
+          intr->intrinsic == nir_intrinsic_load_ubo_vec4)
+         d = 0;
+   } else if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      d = 0;
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs && d >= 0; i++) {
+         int sd = cheap_depth(alu->src[i].src.ssa, memo);
+         d = sd < 0 ? -1 : MAX2(d, sd + 1);
+      }
+   }
+   _mesa_hash_table_insert(memo, def, (void *)(intptr_t)(d + 2));
+   return d;
+}
+
+/*
+ * def is per pixel: anything but constants, uniforms and ALU ops on those
+ * (uniform-only values are computed at draw time)
+ */
+static bool
+reads_varying(nir_def *def, struct hash_table *memo)
+{
+   struct hash_entry *e = _mesa_hash_table_search(memo, def);
+   if (e)
+      return (intptr_t)e->data == 2;
+   nir_instr *instr = nir_def_instr(def);
+   bool r = true;
+   if (instr->type == nir_instr_type_load_const) {
+      r = false;
+   } else if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      r = intr->intrinsic != nir_intrinsic_load_ubo &&
+          intr->intrinsic != nir_intrinsic_load_ubo_vec4;
+   } else if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      r = false;
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs && !r; i++)
+         r = reads_varying(alu->src[i].src.ssa, memo);
+   }
+   _mesa_hash_table_insert(memo, def, (void *)(intptr_t)(r ? 2 : 1));
+   return r;
+}
+
+static nir_def *
+clone_cheap(nir_shader *s, nir_def *def, nir_instr *before, struct hash_table *remap,
+            struct hash_table *vmemo)
+{
+   struct hash_entry *e = _mesa_hash_table_search(remap, def);
+   if (e)
+      return e->data;
+   nir_instr *instr = nir_def_instr(def);
+   /* uniform-only parts stay shared: one draw-time value each */
+   if (instr->type == nir_instr_type_alu && reads_varying(def, vmemo)) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+         clone_cheap(s, alu->src[i].src.ssa, before, remap, vmemo);
+      nir_instr *copy = nir_instr_clone_deep(s, instr, remap);
+      nir_instr_insert_before(before, copy);
+      return nir_instr_def(copy);
+   }
+   return def; /* loads and constants: shared (varyings re-interpolate) */
+}
+
+/*
+ * Values computed from varyings and uniforms only, like a texture
+ * coordinate's matrix product, again at each of their users instead of
+ * held in a register in between: a few ALU slots instead of a register
+ * across a blur's taps.
+ */
+static bool
+rematerialize_cheap(nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   if (exec_list_length(&impl->body) != 1)
+      return false;
+   struct hash_table *memo = _mesa_pointer_hash_table_create(NULL);
+   struct hash_table *vmemo = _mesa_pointer_hash_table_create(NULL);
+   bool progress = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_def *def = &nir_instr_as_alu(instr)->def;
+         int d = cheap_depth(def, memo);
+         if (d < 1 || d > 4 || !reads_varying(def, vmemo))
+            continue;
+         bool first = true;
+         nir_foreach_use_including_if_safe(u, def) {
+            if (nir_src_is_if(u))
+               continue;
+            if (first) {
+               first = false;
+               continue;
+            }
+            nir_instr *user = nir_src_parent_instr(u);
+            struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+            nir_def *copy = clone_cheap(s, def, user, remap, vmemo);
+            _mesa_hash_table_destroy(remap, NULL);
+            nir_src_rewrite(u, copy);
+            progress = true;
+         }
+      }
+   }
+   _mesa_hash_table_destroy(memo, NULL);
+   _mesa_hash_table_destroy(vmemo, NULL);
+   nir_progress(progress, impl, nir_metadata_control_flow);
+   return progress;
+}
+
+/* move def's instruction, and what it reads, right before instr if it
+ * comes after it (pure instructions only: ALU, loads, constants) */
+static void
+hoist_before(nir_def *def, nir_instr *instr)
+{
+   nir_instr *di = nir_def_instr(def);
+   bool after = false;
+   for (nir_instr *i = nir_instr_next(instr); i; i = nir_instr_next(i)) {
+      if (i == di) {
+         after = true;
+         break;
+      }
+   }
+   if (!after)
+      return;
+   if (di->type == nir_instr_type_alu) {
+      nir_alu_instr *a = nir_instr_as_alu(di);
+      for (unsigned i = 0; i < nir_op_infos[a->op].num_inputs; i++)
+         hoist_before(a->src[i].src.ssa, instr);
+   } else if (di->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(di);
+      for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++)
+         hoist_before(intr->src[i].ssa, instr);
+   }
+   nir_instr_remove(di);
+   nir_instr_insert_before(instr, di);
+}
+
+static bool
+sink_uniform_addend(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   struct hash_table *vmemo = data;
+   if (alu->op != nir_op_fadd || alu->def.num_components != 1)
+      return false;
+   for (int i = 0; i < 2; i++) {
+      nir_def *x = alu->src[i].src.ssa, *u = alu->src[1 - i].src.ssa;
+      if (reads_varying(u, vmemo) || !reads_varying(x, vmemo))
+         continue;
+      if (alu->src[i].swizzle[0] || !nir_def_is_alu(x) || !list_is_singular(&x->uses))
+         continue;
+      /* down the addends of the ffma chain to its last term */
+      nir_alu_instr *t = nir_def_as_alu(x);
+      while (t->op == nir_op_ffma && !t->src[2].swizzle[0] &&
+             nir_def_is_alu(t->src[2].src.ssa) &&
+             list_is_singular(&t->src[2].src.ssa->uses) &&
+             (nir_def_as_alu(t->src[2].src.ssa)->op == nir_op_ffma ||
+              nir_def_as_alu(t->src[2].src.ssa)->op == nir_op_fmul))
+         t = nir_def_as_alu(t->src[2].src.ssa);
+      if (t->op != nir_op_fmul && t->op != nir_op_ffma)
+         continue;
+      hoist_before(u, &t->instr);
+      b->cursor = nir_before_instr(&t->instr);
+      nir_def *us = nir_ssa_for_alu_src(b, alu, 1 - i);
+      nir_def *nt;
+      if (t->op == nir_op_fmul) {
+         nt = nir_ffma(b, nir_ssa_for_alu_src(b, t, 0), nir_ssa_for_alu_src(b, t, 1), us);
+      } else {
+         /* t = a * b + c, c not a chain: a * b + (c + u) */
+         nt = nir_ffma(b, nir_ssa_for_alu_src(b, t, 0), nir_ssa_for_alu_src(b, t, 1),
+                       nir_fadd(b, nir_ssa_for_alu_src(b, t, 2), us));
+      }
+      bool top = &t->def == x;
+      nir_def_rewrite_uses(&t->def, nt);
+      /* the sum is the chain's top term: that's the new one now */
+      nir_def_replace(&alu->def, top ? nt : x);
+      return true;
+   }
+   return false;
+}
+
+/* the ALU instructions computing def that read a varying, in program order */
+static void
+chain_instrs(nir_def *def, struct set *seen, struct util_dynarray *out,
+             struct hash_table *vmemo)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_alu || _mesa_set_search(seen, instr) ||
+       !reads_varying(def, vmemo))
+      return;
+   _mesa_set_add(seen, instr);
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+      chain_instrs(alu->src[i].src.ssa, seen, out, vmemo);
+   util_dynarray_append_typed(out, nir_instr *, instr);
+}
+
+/*
+ * A texture coordinate's x and y, each computed from the same varyings:
+ * interleave the two chains step by step right before the lookup, so the
+ * varyings die early and x and y take their registers.
+ */
+static bool
+interleave_coords(nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   struct hash_table *vmemo = _mesa_pointer_hash_table_create(NULL);
+   bool progress = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         int c = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+         if (c < 0)
+            continue;
+         nir_def *coord = tex->src[c].src.ssa;
+         if (!nir_def_is_alu(coord) || nir_def_as_alu(coord)->op != nir_op_vec2)
+            continue;
+         nir_alu_instr *vec = nir_def_as_alu(coord);
+         struct set *seen = _mesa_pointer_set_create(NULL);
+         struct util_dynarray ch[2];
+         for (int k = 0; k < 2; k++) {
+            util_dynarray_init(&ch[k], NULL);
+            chain_instrs(vec->src[k].src.ssa, seen, &ch[k], vmemo);
+         }
+         /* only chains of their own (no instruction shared, none used elsewhere) */
+         bool own = true;
+         for (int k = 0; k < 2 && own; k++) {
+            util_dynarray_foreach(&ch[k], nir_instr *, ip) {
+               nir_def *d = nir_instr_def(*ip);
+               nir_foreach_use_including_if(u, d) {
+                  if (nir_src_is_if(u)) { own = false; break; }
+                  nir_instr *user = nir_src_parent_instr(u);
+                  if (user != &vec->instr && !_mesa_set_search(seen, user)) { own = false; break; }
+               }
+               if (!own)
+                  break;
+            }
+         }
+         unsigned n0 = util_dynarray_num_elements(&ch[0], nir_instr *);
+         unsigned n1 = util_dynarray_num_elements(&ch[1], nir_instr *);
+         if (own && n0 && n1) {
+            /* fresh copies of the varyings the chains read, together first */
+            nir_instr *first = *util_dynarray_element(&ch[0], nir_instr *, 0);
+            struct hash_table *loads = _mesa_pointer_hash_table_create(NULL);
+            for (int k = 0; k < 2; k++) {
+               util_dynarray_foreach(&ch[k], nir_instr *, ip) {
+                  nir_alu_instr *alu = nir_instr_as_alu(*ip);
+                  for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+                     nir_def *d = alu->src[i].src.ssa;
+                     nir_instr *li = nir_def_instr(d);
+                     if (li->type != nir_instr_type_intrinsic)
+                        continue;
+                     nir_intrinsic_instr *intr = nir_instr_as_intrinsic(li);
+                     if (intr->intrinsic != nir_intrinsic_load_input &&
+                         intr->intrinsic != nir_intrinsic_load_interpolated_input)
+                        continue;
+                     struct hash_entry *e = _mesa_hash_table_search(loads, d);
+                     nir_def *copy;
+                     if (e) {
+                        copy = e->data;
+                     } else {
+                        nir_instr *c2 = nir_instr_clone(s, li);
+                        nir_instr_insert_before(first, c2);
+                        copy = nir_instr_def(c2);
+                        _mesa_hash_table_insert(loads, d, copy);
+                     }
+                     nir_src_rewrite(&alu->src[i].src, copy);
+                  }
+               }
+            }
+            _mesa_hash_table_destroy(loads, NULL);
+            for (unsigned i = 0; i < MAX2(n0, n1); i++) {
+               for (int k = 0; k < 2; k++) {
+                  unsigned n = k ? n1 : n0;
+                  if (i >= n)
+                     continue;
+                  nir_instr *mv = *util_dynarray_element(&ch[k], nir_instr *, i);
+                  nir_instr_remove(mv);
+                  nir_instr_insert_before(&vec->instr, mv);
+               }
+            }
+            progress = true;
+         }
+         util_dynarray_fini(&ch[0]);
+         util_dynarray_fini(&ch[1]);
+         _mesa_set_destroy(seen, NULL);
+      }
+   }
+   _mesa_hash_table_destroy(vmemo, NULL);
+   nir_progress(progress, impl, nir_metadata_control_flow);
+   return progress;
+}
+
+/*
+ * x + u with u uniform-only and x = a * b (+ ...): u as the innermost
+ * addend, a * b + u, so the sum is a chain of multiply-adds with no add of
+ * its own at the end.
+ */
+
 static int
 type_size_vec4(const struct glsl_type *type, bool bindless)
 {
@@ -3265,17 +3783,161 @@ grate_nir_fs_lower(nir_shader *s)
  *  1. inputs re-loaded per user, then a depth-first order from the output;
  *  2. NIR's order through nir_schedule's register-pressure fallback;
  *  3. 1 then 2;
- *  4. a greedy order that frees registers first (reorder_pressure()).
+ *  4. a greedy order that frees registers first (reorder_pressure());
+ *  5. texture coordinates regrouped as affine sums (blurs, see
+ *     interleave_coords()).
  * Then the same orders again, spilling to render targets when registers
  * run out.
  */
-/* batches drawn, and a full-screen pass costs as much as a few */
+/*
+ * A chain of adds, multiplies and negations on one per-pixel value x with
+ * uniform operands is x * A + B, A and B uniform: one MAD, with A and B
+ * computed at draw time. E.g. Skia's sk_FragCoord.y is a y flip on top of
+ * the window-system one, then a rect corner is subtracted: four ALU ops
+ * that become one.
+ */
+struct affine {
+   nir_scalar x;   /* the per-pixel value, when has_x */
+   bool has_x;
+   nir_def *a;     /* x's factor (NULL: 1), when has_x */
+   nir_def *b;     /* the uniform term (NULL: 0) */
+   int ops;        /* per-pixel ALU ops it takes now */
+};
+
+/* the passes after this one read divergence: what is built here is uniform */
+static nir_def *
+unif(nir_def *d)
+{
+   d->divergent = false;
+   return d;
+}
+
+static nir_def *
+aff_one(nir_builder *b, nir_def *a)
+{
+   return a ? a : unif(nir_imm_float(b, 1.0f));
+}
+
+static nir_def *
+aff_add(nir_builder *b, nir_def *x, nir_def *y)
+{
+   return !x ? y : !y ? x : unif(nir_fadd(b, x, y));
+}
+
+static bool
+affine_of(nir_builder *b, nir_scalar s, struct affine *r, int depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (s.def->bit_size != 32)
+      return false;
+   if (!s.def->divergent) {
+      *r = (struct affine) { .b = unif(nir_mov_scalar(b, s)) };
+      return true;
+   }
+   *r = (struct affine) { .x = s, .has_x = true };
+   if (depth > 8 || !nir_scalar_is_alu(s))
+      return true;
+   nir_op op = nir_scalar_alu_op(s);
+   if (op != nir_op_fneg && op != nir_op_fadd && op != nir_op_fmul &&
+       op != nir_op_ffma)
+      return true;
+
+   struct affine p[3];
+   for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++)
+      if (!affine_of(b, nir_scalar_chase_alu_src(s, i), &p[i], depth + 1))
+         return true;
+
+   struct affine t;
+   if (op == nir_op_fneg) {
+      t = p[0];
+      if (t.has_x)
+         t.a = unif(nir_fneg(b, aff_one(b, t.a)));
+      if (t.b)
+         t.b = unif(nir_fneg(b, t.b));
+      *r = t;
+      return true;
+   }
+   if (op == nir_op_fmul || op == nir_op_ffma) {
+      /* one factor must be uniform, and not 0 by omission */
+      int u = !p[0].has_x ? 0 : !p[1].has_x ? 1 : -1;
+      if (u < 0 || !p[u].b)
+         return true;
+      t = p[1 - u];
+      if (t.has_x)
+         t.a = t.a ? unif(nir_fmul(b, t.a, p[u].b)) : p[u].b;
+      if (t.b)
+         t.b = unif(nir_fmul(b, t.b, p[u].b));
+      t.ops += t.has_x;
+      if (op == nir_op_fmul) {
+         *r = t;
+         return true;
+      }
+      p[0] = t;
+      p[1] = p[2];
+   }
+   /* a sum (or the add of a ffma, which costs nothing more) */
+   if (p[0].has_x && p[1].has_x &&
+       (p[0].x.def != p[1].x.def || p[0].x.comp != p[1].x.comp))
+      return true;
+   t.has_x = p[0].has_x || p[1].has_x;
+   t.x = p[0].has_x ? p[0].x : p[1].x;
+   if (p[0].has_x && p[1].has_x)
+      t.a = unif(nir_fadd(b, aff_one(b, p[0].a), aff_one(b, p[1].a)));
+   else
+      t.a = p[0].has_x ? p[0].a : p[1].a;
+   t.b = aff_add(b, p[0].b, p[1].b);
+   t.ops = p[0].ops + p[1].ops + (op == nir_op_fadd);
+   *r = t;
+   return true;
+}
+
+static bool
+collapse_affine(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_fadd && alu->op != nir_op_fmul &&
+        alu->op != nir_op_ffma) ||
+       alu->def.num_components != 1 || !alu->def.divergent)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   struct affine t;
+   if (!affine_of(b, nir_get_scalar(&alu->def, 0), &t, 0) || !t.has_x ||
+       t.ops < 2)
+      return false;
+   nir_def *x = nir_mov_scalar(b, t.x);
+   nir_def *v = !t.a ? (t.b ? nir_fadd(b, x, t.b) : x) :
+                !t.b ? nir_fmul(b, x, t.a) : nir_ffma(b, x, t.a, t.b);
+   x->divergent = v->divergent = true;
+   nir_def_replace(&alu->def, v);
+   return true;
+}
+
+static void
+collapse_affine_chains(nir_shader *s)
+{
+   nir_foreach_function_impl(impl, s)
+      nir_metadata_require(impl, nir_metadata_divergence);
+   NIR_PASS(_, s, nir_shader_alu_pass, collapse_affine,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, s, nir_opt_constant_folding);
+   NIR_PASS(_, s, nir_opt_copy_prop);
+   NIR_PASS(_, s, nir_opt_cse);
+   NIR_PASS(_, s, nir_opt_dce);
+}
+
+/* time to draw a pixel, and a full-screen pass costs as much as a few */
 static int
 program_cost(struct grate_fp_shader *fps, int n)
 {
+   /*
+    * Measured on the hardware: a batch takes about as long with no ALU
+    * packet as with one (MFU and TEX work ride along), and each further
+    * packet about as long as another batch.
+    */
    int cost = 8 * (n - 1);
-   for (int k = 0; k < n; k++)
-      cost += list_length(&fps[k].fp_instructions);
+   for (int k = 0; k < n; k++) {
+      list_for_each_entry(struct fp_instr, inst, &fps[k].fp_instructions, link)
+         cost += MAX2(1, inst->alu_sched.num_instructions);
+   }
    return cost;
 }
 
@@ -3286,7 +3948,27 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
 {
    const nir_schedule_options sched = { .threshold = 4, .fallback = true };
    nir_shader *v = nir_shader_clone(NULL, s);
-   if (order == 4) {
+   /* orders 6-11: 0-5 on collapsed affine chains (more uniforms, which a
+    * tight shader may not fit) */
+   if (order >= 6) {
+      collapse_affine_chains(v);
+      order -= 6;
+   }
+   if (order == 5) {
+      /* texture coordinates as affine sums: their uniform parts computed at
+       * draw time, the rest recomputed at each lookup, x and y side by side */
+      reassociate_affine(v);
+      NIR_PASS(_, v, nir_opt_algebraic_late);
+      NIR_PASS(_, v, nir_opt_copy_prop);
+      NIR_PASS(_, v, nir_opt_dce);
+      rematerialize_cheap(v);
+      struct hash_table *vm = _mesa_pointer_hash_table_create(NULL);
+      NIR_PASS(_, v, nir_shader_alu_pass, sink_uniform_addend,
+               nir_metadata_control_flow, vm);
+      _mesa_hash_table_destroy(vm, NULL);
+      NIR_PASS(_, v, nir_opt_dce);
+      interleave_coords(v);
+   } else if (order == 4) {
       NIR_PASS(_, v, reorder_pressure);
    } else {
       if (order & 1) {
@@ -3346,7 +4028,7 @@ ladder(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    /* one pass, then several, each with every order: the cheapest wins */
    for (int i = -1; i < (int)ARRAY_SIZE(cuts); i++) {
       bool fit = false;
-      for (int order = 0; order < 5; order++) {
+      for (int order = 0; order < 12; order++) {
          struct grate_fp_shader alt[GRATE_FP_MAX_SEGMENTS];
          int n = 0;
          if (!try_compile(alt, &n, s, blended, order, true, chain, rows,
@@ -3378,7 +4060,7 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
    for (int chain = 1; chain >= 0; chain--) {
       /* every order that fits: the cheapest wins */
       bool fit = false;
-      for (int order = 0; order < 5; order++) {
+      for (int order = 0; order < 12; order++) {
          struct grate_fp_shader alt[1];
          int n = 0;
          if (try_compile(alt, &n, s, blended, order, false, chain, 1, 1, INT_MAX,
