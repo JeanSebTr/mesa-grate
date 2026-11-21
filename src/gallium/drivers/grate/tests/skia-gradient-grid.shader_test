@@ -1,0 +1,249 @@
+# Skia's multi-stop gradient (unrolled binary search over five intervals,
+# t * scale + bias in each) with its vertex shader, as skia-gradient.shader_test,
+# probed on a 20 px grid away from the stops: a 4-row multi-pass program can be
+# right at a few probes and wrong elsewhere
+[require]
+GL ES >= 2.0
+GLSL ES >= 1.00
+
+[vertex shader]
+#version 100
+
+precision mediump float;
+precision mediump sampler2D;
+uniform highp vec4 sk_RTAdjust;
+uniform highp mat3 umatrix_S1_c0_c1;
+attribute highp vec2 position;
+attribute mediump vec4 color;
+attribute highp vec2 localCoord;
+varying mediump vec4 vcolor_S0;
+varying highp vec2 vTransformedCoords_5_S0;
+void main() {
+vcolor_S0 = color;
+gl_Position = vec4(position, 0.0, 1.0);
+{
+vTransformedCoords_5_S0 = (umatrix_S1_c0_c1 * vec3(localCoord, 1.0)).xy;
+}
+gl_Position = vec4(gl_Position.xy * sk_RTAdjust.xz + gl_Position.ww * sk_RTAdjust.yw, 0.0, gl_Position.w);
+}
+
+[fragment shader]
+#version 100
+
+precision mediump float;
+precision mediump sampler2D;
+uniform mediump vec4 uthresholds1_7_S1_c0_c0;
+uniform highp vec4 uscale_S1_c0_c0[5];
+uniform highp vec4 ubias_S1_c0_c0[5];
+uniform highp mat3 umatrix_S1_c0_c1;
+uniform mediump vec4 uleftBorderColor_S1_c0;
+uniform mediump vec4 urightBorderColor_S1_c0;
+varying mediump vec4 vcolor_S0;
+varying highp vec2 vTransformedCoords_5_S0;
+void main() {
+mediump vec4 outputColor_S0 = vcolor_S0;
+mediump vec4 _19_input = outputColor_S0;
+highp vec2 _22_tmp_3_coords = vTransformedCoords_5_S0;
+mediump vec4 _23_t = vec4(_22_tmp_3_coords.x + 1e-05, 1.0, 0.0, 0.0);
+mediump vec4 _24_outColor;
+if (_23_t.x < 0.0) {
+_24_outColor = uleftBorderColor_S1_c0;
+} else if (_23_t.x > 1.0) {
+_24_outColor = urightBorderColor_S1_c0;
+} else {
+highp vec2 _26_tmp_1_coords = vec2(_23_t.x, 0.0);
+mediump float _27_t = _26_tmp_1_coords.x;
+highp vec4 _28_s;
+highp vec4 _29_b;
+if (_27_t < uthresholds1_7_S1_c0_c0.w) {
+if (_27_t < uthresholds1_7_S1_c0_c0.y) {
+if (_27_t < uthresholds1_7_S1_c0_c0.x) {
+_28_s = uscale_S1_c0_c0[0];
+_29_b = ubias_S1_c0_c0[0];
+} else {
+_28_s = uscale_S1_c0_c0[1];
+_29_b = ubias_S1_c0_c0[1];
+}
+} else {
+if (_27_t < uthresholds1_7_S1_c0_c0.z) {
+_28_s = uscale_S1_c0_c0[2];
+_29_b = ubias_S1_c0_c0[2];
+} else {
+_28_s = uscale_S1_c0_c0[3];
+_29_b = ubias_S1_c0_c0[3];
+}
+}
+} else {
+{
+{
+_28_s = uscale_S1_c0_c0[4];
+_29_b = ubias_S1_c0_c0[4];
+}
+}
+}
+_24_outColor = _27_t * _28_s + _29_b;
+}
+_19_input = _24_outColor;
+mediump vec4 output_S1 = _19_input;
+{
+gl_FragColor = output_S1;
+}
+}
+
+[vertex data]
+position/float/2 color/float/4 localCoord/float/2
+-1.0 -1.0  1.0 1.0 1.0 1.0  0.0 0.0
+ 1.0 -1.0  1.0 1.0 1.0 1.0  60.0 0.0
+ 1.0  1.0  1.0 1.0 1.0 1.0  60.0 60.0
+-1.0  1.0  1.0 1.0 1.0 1.0  0.0 60.0
+
+[test]
+uniform vec4 sk_RTAdjust 1.0 0.0 1.0 0.0
+uniform mat3 umatrix_S1_c0_c1 0.00707107 0.00707107 0.0 -0.00707107 0.00707107 0.0 0.424264 -0.424264 1.0
+uniform vec4 uthresholds1_7_S1_c0_c0 0.2 0.4 0.6 0.8
+uniform vec4 uscale_S1_c0_c0[0] 0.0 0.0 0.0 0.0
+uniform vec4 uscale_S1_c0_c0[1] 0.0 0.0 0.0 0.0
+uniform vec4 uscale_S1_c0_c0[2] 0.0 0.0 0.0 0.0
+uniform vec4 uscale_S1_c0_c0[3] 0.0 0.0 0.0 0.0
+uniform vec4 uscale_S1_c0_c0[4] 0.0 0.0 0.0 0.0
+uniform vec4 ubias_S1_c0_c0[0] 0.933333 0.2 0.2 1.0
+uniform vec4 ubias_S1_c0_c0[1] 0.2 0.666667 0.933333 1.0
+uniform vec4 ubias_S1_c0_c0[2] 0.933333 0.2 0.2 1.0
+uniform vec4 ubias_S1_c0_c0[3] 0.2 0.666667 0.933333 1.0
+uniform vec4 ubias_S1_c0_c0[4] 0.933333 0.2 0.2 1.0
+uniform vec4 uleftBorderColor_S1_c0 0.933333 0.2 0.2 1.0
+uniform vec4 urightBorderColor_S1_c0 0.933333 0.2 0.2 1.0
+draw arrays GL_TRIANGLE_FAN 0 4
+probe rgba 5 7 0.933333 0.2 0.2 1.0
+probe rgba 5 47 0.2 0.666667 0.933333 1.0
+probe rgba 5 67 0.2 0.666667 0.933333 1.0
+probe rgba 5 87 0.2 0.666667 0.933333 1.0
+probe rgba 5 107 0.2 0.666667 0.933333 1.0
+probe rgba 5 167 0.933333 0.2 0.2 1.0
+probe rgba 5 187 0.933333 0.2 0.2 1.0
+probe rgba 5 207 0.933333 0.2 0.2 1.0
+probe rgba 5 227 0.933333 0.2 0.2 1.0
+probe rgba 25 7 0.933333 0.2 0.2 1.0
+probe rgba 25 27 0.933333 0.2 0.2 1.0
+probe rgba 25 67 0.2 0.666667 0.933333 1.0
+probe rgba 25 87 0.2 0.666667 0.933333 1.0
+probe rgba 25 107 0.2 0.666667 0.933333 1.0
+probe rgba 25 127 0.2 0.666667 0.933333 1.0
+probe rgba 25 187 0.933333 0.2 0.2 1.0
+probe rgba 25 207 0.933333 0.2 0.2 1.0
+probe rgba 25 227 0.933333 0.2 0.2 1.0
+probe rgba 25 247 0.933333 0.2 0.2 1.0
+probe rgba 45 7 0.933333 0.2 0.2 1.0
+probe rgba 45 27 0.933333 0.2 0.2 1.0
+probe rgba 45 47 0.933333 0.2 0.2 1.0
+probe rgba 45 87 0.2 0.666667 0.933333 1.0
+probe rgba 45 107 0.2 0.666667 0.933333 1.0
+probe rgba 45 127 0.2 0.666667 0.933333 1.0
+probe rgba 45 147 0.2 0.666667 0.933333 1.0
+probe rgba 45 207 0.933333 0.2 0.2 1.0
+probe rgba 45 227 0.933333 0.2 0.2 1.0
+probe rgba 45 247 0.933333 0.2 0.2 1.0
+probe rgba 65 7 0.933333 0.2 0.2 1.0
+probe rgba 65 27 0.933333 0.2 0.2 1.0
+probe rgba 65 47 0.933333 0.2 0.2 1.0
+probe rgba 65 67 0.933333 0.2 0.2 1.0
+probe rgba 65 107 0.2 0.666667 0.933333 1.0
+probe rgba 65 127 0.2 0.666667 0.933333 1.0
+probe rgba 65 147 0.2 0.666667 0.933333 1.0
+probe rgba 65 167 0.2 0.666667 0.933333 1.0
+probe rgba 65 227 0.933333 0.2 0.2 1.0
+probe rgba 65 247 0.933333 0.2 0.2 1.0
+probe rgba 85 7 0.933333 0.2 0.2 1.0
+probe rgba 85 27 0.933333 0.2 0.2 1.0
+probe rgba 85 47 0.933333 0.2 0.2 1.0
+probe rgba 85 67 0.933333 0.2 0.2 1.0
+probe rgba 85 87 0.933333 0.2 0.2 1.0
+probe rgba 85 127 0.2 0.666667 0.933333 1.0
+probe rgba 85 147 0.2 0.666667 0.933333 1.0
+probe rgba 85 167 0.2 0.666667 0.933333 1.0
+probe rgba 85 187 0.2 0.666667 0.933333 1.0
+probe rgba 85 247 0.933333 0.2 0.2 1.0
+probe rgba 105 27 0.933333 0.2 0.2 1.0
+probe rgba 105 47 0.933333 0.2 0.2 1.0
+probe rgba 105 67 0.933333 0.2 0.2 1.0
+probe rgba 105 87 0.933333 0.2 0.2 1.0
+probe rgba 105 107 0.933333 0.2 0.2 1.0
+probe rgba 105 147 0.2 0.666667 0.933333 1.0
+probe rgba 105 167 0.2 0.666667 0.933333 1.0
+probe rgba 105 187 0.2 0.666667 0.933333 1.0
+probe rgba 105 207 0.2 0.666667 0.933333 1.0
+probe rgba 125 7 0.2 0.666667 0.933333 1.0
+probe rgba 125 47 0.933333 0.2 0.2 1.0
+probe rgba 125 67 0.933333 0.2 0.2 1.0
+probe rgba 125 87 0.933333 0.2 0.2 1.0
+probe rgba 125 107 0.933333 0.2 0.2 1.0
+probe rgba 125 127 0.933333 0.2 0.2 1.0
+probe rgba 125 167 0.2 0.666667 0.933333 1.0
+probe rgba 125 187 0.2 0.666667 0.933333 1.0
+probe rgba 125 207 0.2 0.666667 0.933333 1.0
+probe rgba 125 227 0.2 0.666667 0.933333 1.0
+probe rgba 145 7 0.2 0.666667 0.933333 1.0
+probe rgba 145 27 0.2 0.666667 0.933333 1.0
+probe rgba 145 67 0.933333 0.2 0.2 1.0
+probe rgba 145 87 0.933333 0.2 0.2 1.0
+probe rgba 145 107 0.933333 0.2 0.2 1.0
+probe rgba 145 127 0.933333 0.2 0.2 1.0
+probe rgba 145 147 0.933333 0.2 0.2 1.0
+probe rgba 145 187 0.2 0.666667 0.933333 1.0
+probe rgba 145 207 0.2 0.666667 0.933333 1.0
+probe rgba 145 227 0.2 0.666667 0.933333 1.0
+probe rgba 145 247 0.2 0.666667 0.933333 1.0
+probe rgba 165 7 0.2 0.666667 0.933333 1.0
+probe rgba 165 27 0.2 0.666667 0.933333 1.0
+probe rgba 165 47 0.2 0.666667 0.933333 1.0
+probe rgba 165 87 0.933333 0.2 0.2 1.0
+probe rgba 165 107 0.933333 0.2 0.2 1.0
+probe rgba 165 127 0.933333 0.2 0.2 1.0
+probe rgba 165 147 0.933333 0.2 0.2 1.0
+probe rgba 165 167 0.933333 0.2 0.2 1.0
+probe rgba 165 207 0.2 0.666667 0.933333 1.0
+probe rgba 165 227 0.2 0.666667 0.933333 1.0
+probe rgba 165 247 0.2 0.666667 0.933333 1.0
+probe rgba 185 7 0.2 0.666667 0.933333 1.0
+probe rgba 185 27 0.2 0.666667 0.933333 1.0
+probe rgba 185 47 0.2 0.666667 0.933333 1.0
+probe rgba 185 67 0.2 0.666667 0.933333 1.0
+probe rgba 185 107 0.933333 0.2 0.2 1.0
+probe rgba 185 127 0.933333 0.2 0.2 1.0
+probe rgba 185 147 0.933333 0.2 0.2 1.0
+probe rgba 185 167 0.933333 0.2 0.2 1.0
+probe rgba 185 187 0.933333 0.2 0.2 1.0
+probe rgba 185 227 0.2 0.666667 0.933333 1.0
+probe rgba 185 247 0.2 0.666667 0.933333 1.0
+probe rgba 205 7 0.2 0.666667 0.933333 1.0
+probe rgba 205 27 0.2 0.666667 0.933333 1.0
+probe rgba 205 47 0.2 0.666667 0.933333 1.0
+probe rgba 205 67 0.2 0.666667 0.933333 1.0
+probe rgba 205 87 0.2 0.666667 0.933333 1.0
+probe rgba 205 127 0.933333 0.2 0.2 1.0
+probe rgba 205 147 0.933333 0.2 0.2 1.0
+probe rgba 205 167 0.933333 0.2 0.2 1.0
+probe rgba 205 187 0.933333 0.2 0.2 1.0
+probe rgba 205 207 0.933333 0.2 0.2 1.0
+probe rgba 205 247 0.2 0.666667 0.933333 1.0
+probe rgba 225 27 0.2 0.666667 0.933333 1.0
+probe rgba 225 47 0.2 0.666667 0.933333 1.0
+probe rgba 225 67 0.2 0.666667 0.933333 1.0
+probe rgba 225 87 0.2 0.666667 0.933333 1.0
+probe rgba 225 107 0.2 0.666667 0.933333 1.0
+probe rgba 225 147 0.933333 0.2 0.2 1.0
+probe rgba 225 167 0.933333 0.2 0.2 1.0
+probe rgba 225 187 0.933333 0.2 0.2 1.0
+probe rgba 225 207 0.933333 0.2 0.2 1.0
+probe rgba 225 227 0.933333 0.2 0.2 1.0
+probe rgba 245 7 0.933333 0.2 0.2 1.0
+probe rgba 245 47 0.2 0.666667 0.933333 1.0
+probe rgba 245 67 0.2 0.666667 0.933333 1.0
+probe rgba 245 87 0.2 0.666667 0.933333 1.0
+probe rgba 245 107 0.2 0.666667 0.933333 1.0
+probe rgba 245 127 0.2 0.666667 0.933333 1.0
+probe rgba 245 167 0.933333 0.2 0.2 1.0
+probe rgba 245 187 0.933333 0.2 0.2 1.0
+probe rgba 245 207 0.933333 0.2 0.2 1.0
+probe rgba 245 227 0.933333 0.2 0.2 1.0
+probe rgba 245 247 0.933333 0.2 0.2 1.0
