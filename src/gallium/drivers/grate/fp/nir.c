@@ -1691,6 +1691,21 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
       srcs[i]->sub_reg_select_high = false;
    }
 
+   /*
+    * The sources were noted as read in the batch that was current then;
+    * this op may have gone one or two batches further (a fresh batch for a
+    * source written just before, then another one). A source register
+    * whose value is already released stays busy until this batch: an ALU
+    * write lands a batch late and couldn't get in the way, but a PSEQ
+    * lands early (at the start of its round) and would.
+    */
+   for (int i = 0; i < 3; i++) {
+      unsigned r = srcs[i]->index;
+      if (r < 16 && c->reg_busy_until[r] != INT_MAX &&
+          c->reg_busy_until[r] < c->num_batches - 1)
+         c->reg_busy_until[r] = c->num_batches - 1;
+   }
+
    int k = c->pkt_slots++;
    struct fp_alu_instr *slot = &c->pkt->slots[k];
    if (dst->index < 16) {
