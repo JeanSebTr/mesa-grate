@@ -32,3 +32,14 @@ doesn't have yet: `shader_runner-blend.patch` adds `enable GL_BLEND` and
 
 Avoid running untested programs while a compositor is drawing: a bad
 program can hang GR3D, and only a reboot clears that.
+
+## Every candidate order
+
+The fragment compiler tries 16 instruction orders and keeps the cheapest
+program; the others only run for other shaders. `GRATE_FP_ORDERS=<mask>`
+restricts the candidates (bit n = order n), and `sweep-orders.sh` runs
+every test under each order alone and lists the wrong results (orders that
+can't compile a test at all are listed separately):
+
+    ./sweep-orders.sh /path/to/shader_runner_gles2
+

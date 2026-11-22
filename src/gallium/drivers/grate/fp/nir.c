@@ -3983,6 +3983,14 @@ program_cost(struct grate_fp_shader *fps, int n)
 /* instruction orders tried, each also on collapsed affine chains */
 #define GRATE_FP_ORDERS 8
 
+/*
+ * GRATE_FP_ORDERS=<mask>: only try the candidate orders whose bit is set
+ * (0-15, see try_compile()), for testing each order's programs on the
+ * hardware: the cheapest one is what normally runs, the others only for
+ * other shaders. A shader none of them compiles is drawn as nothing.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(fp_orders, "GRATE_FP_ORDERS", -1)
+
 static bool
 try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
             bool blended, int order, bool spill, bool chain, int rows,
@@ -3993,6 +4001,8 @@ try_compile(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
     * a batch's packets, the threshold keeps pressure near the four row
     * registers */
    const nir_schedule_options parallel = { .threshold = 4 };
+   if (!(debug_get_option_fp_orders() & (1ll << order)))
+      return false;
    nir_shader *v = nir_shader_clone(NULL, s);
    /* orders 8-15: 0-7 on collapsed affine chains (more uniforms, which a
     * tight shader may not fit) */
