@@ -31,6 +31,9 @@ struct grate_context;
 void
 grate_flush_3d(struct grate_context *context);
 
+void
+grate_finish_3d(struct grate_context *context);
+
 struct grate_context {
    struct pipe_context base;
    struct primconvert_context *primconvert;

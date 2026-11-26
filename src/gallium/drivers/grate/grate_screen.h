@@ -32,4 +32,10 @@ grate_screen(struct pipe_screen *screen)
 struct pipe_screen *
 grate_screen_create(int fd);
 
+struct drm_tegra_fence;
+
+/* takes ownership of fence */
+struct pipe_fence_handle *
+grate_fence_create(struct drm_tegra_fence *fence);
+
 #endif

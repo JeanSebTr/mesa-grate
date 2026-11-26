@@ -109,10 +109,14 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    if (!ptrans)
       return NULL;
 
-   /* the pending 3D job reads or writes it: run it first */
+   /*
+    * Wait for the 3D work that may use the buffer: the pending job and the
+    * jobs still running. Unsynchronized maps (u_upload_mgr) write past what
+    * earlier draws read, and don't wait.
+    */
    if (!(usage & PIPE_MAP_UNSYNCHRONIZED) &&
-       grate_stream_references(&context->gr3d->stream, resource->bo))
-      grate_flush_3d(context);
+       grate_stream_busy(&context->gr3d->stream, resource->bo))
+      grate_finish_3d(context);
 
    if (drm_tegra_bo_map(resource->bo, &ret))
       return NULL;
@@ -327,10 +331,10 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
    dst = grate_resource(info->dst.resource);
    src = grate_resource(info->src.resource);
 
-   /* 2D jobs run at once: the pending 3D job first if it uses either */
+   /* 2D jobs run at once: 3D work that uses either first */
    struct grate_stream *s3d = &gr2d->context->gr3d->stream;
-   if (grate_stream_references(s3d, dst->bo) || grate_stream_references(s3d, src->bo))
-      grate_flush_3d(gr2d->context);
+   if (grate_stream_busy(s3d, dst->bo) || grate_stream_busy(s3d, src->bo))
+      grate_finish_3d(gr2d->context);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
@@ -419,9 +423,9 @@ fill(struct grate_channel *gr2d,
    uint32_t value;
    int err;
 
-   /* 2D jobs run at once: the pending 3D job first if it uses dst */
-   if (grate_stream_references(&gr2d->context->gr3d->stream, dst->bo))
-      grate_flush_3d(gr2d->context);
+   /* 2D jobs run at once: 3D work that uses dst first */
+   if (grate_stream_busy(&gr2d->context->gr3d->stream, dst->bo))
+      grate_finish_3d(gr2d->context);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
@@ -566,7 +570,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
 static void
 grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
 {
-   grate_flush_3d(grate_context(ctx));
+   grate_finish_3d(grate_context(ctx));
 }
 
 void

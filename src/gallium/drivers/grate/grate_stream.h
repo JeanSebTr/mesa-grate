@@ -41,6 +41,8 @@ enum grate_stream_status {
    GRATE_STREAM_READY,
 };
 
+#define GRATE_STREAM_MAX_INFLIGHT 4
+
 struct grate_command_buffer {
    struct drm_tegra_pushbuf *pushbuf;
 };
@@ -62,6 +64,19 @@ struct grate_stream {
    unsigned num_bos, max_bos;
    /* draws batched into the pending job */
    unsigned num_draws;
+
+   /*
+    * Submitted jobs the GPU may still be running, oldest first. Each keeps
+    * its command buffers and the BOs it uses until it has completed, so
+    * that none of them is freed (or reused from the BO cache) under it.
+    */
+   struct grate_inflight_job {
+      struct drm_tegra_job *job;
+      struct drm_tegra_fence *fence;
+      struct drm_tegra_bo **bos;
+      unsigned num_bos, max_bos;
+   } inflight[GRATE_STREAM_MAX_INFLIGHT];
+   unsigned num_inflight;
 };
 
 struct grate_reloc {
@@ -103,9 +118,22 @@ grate_stream_end(struct grate_stream *stream);
 int
 grate_stream_flush(struct grate_stream *stream);
 
+/* Submit the pending job without waiting for it. */
+int
+grate_stream_submit(struct grate_stream *stream);
+
+/* A copy of the fence of the newest submitted job, or NULL if none runs. */
+struct drm_tegra_fence *
+grate_stream_last_fence(const struct grate_stream *stream);
+
+/* Wait for every submitted job to complete. */
+int
+grate_stream_finish(struct grate_stream *stream);
+
+/* Whether the pending job or a job still running may use the BO. */
 bool
-grate_stream_references(const struct grate_stream *stream,
-                        const struct drm_tegra_bo *bo);
+grate_stream_busy(const struct grate_stream *stream,
+                  const struct drm_tegra_bo *bo);
 
 int
 grate_stream_push(struct grate_stream *stream, uint32_t word);
