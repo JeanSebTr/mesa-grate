@@ -1573,12 +1573,21 @@ written_by(const struct fp_alu_src_operand *rows, int n,
       if (rows[k].index != src->index)
          continue;
       if (rows[k].datatype == FP_DATATYPE_FP20 ||
-          (src->datatype == FP_DATATYPE_FIXED10 &&
-           rows[k].sub_reg_select_high == src->sub_reg_select_high))
+          src->datatype != FP_DATATYPE_FIXED10 ||
+          rows[k].sub_reg_select_high == src->sub_reg_select_high)
          return k;
-      return -1;
+      /* the other half: an earlier slot may have written this one */
    }
    return -1;
+}
+
+/* the halves of its register an operand reads (bit 2r low, 2r+1 high) */
+static uint32_t
+src_halves(const struct fp_alu_src_operand *src)
+{
+   uint32_t h = src->datatype != FP_DATATYPE_FIXED10 ? 3u :
+                src->sub_reg_select_high ? 2u : 1u;
+   return h << (2 * src->index);
 }
 
 /* dst = a * b + c, one batch */
@@ -1606,8 +1615,9 @@ emit_mad(struct comp *c, struct val *dst, enum fp_alu_op op,
    bool nochain = !c->allow_chain ||
                   (c->rows > 1 && c->cur && (c->num_batches - 1) % c->rows == 0);
    for (int i = 0; i < 3; i++) {
+      /* an fx10 half this batch didn't write reads as before */
       if (c->store_packet || srcs[i]->index >= 16 ||
-          !(c->pkt_rows_written & (1u << srcs[i]->index)))
+          !(c->pkt_halves_written & src_halves(srcs[i])))
          continue;
       from_open[i] = c->pkt && !nochain ? written_by(c->pkt_slot_row, c->pkt_slots, srcs[i]) : -1;
       from_prev[i] = nochain ? -1 : written_by(c->prev_slot_row, c->prev_slots, srcs[i]);
