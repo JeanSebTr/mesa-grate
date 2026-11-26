@@ -964,32 +964,6 @@ int drm_tegra_bo_forbid_caching(struct drm_tegra_bo *bo)
 	return 0;
 }
 
-int drm_tegra_bo_cpu_prep(struct drm_tegra_bo *bo,
-			  uint32_t flags, uint32_t timeout_us)
-{
-	struct drm_tegra_gem_cpu_prep args;
-	int ret;
-
-	if (!bo)
-		return -EINVAL;
-
-	memset(&args, 0, sizeof(args));
-	args.flags = flags;
-	args.handle = bo->handle;
-	args.timeout = timeout_us;
-
-	ret = drmCommandWriteRead(bo->drm->fd, DRM_TEGRA_GEM_CPU_PREP, &args,
-				  sizeof(args));
-	if (ret && ret != -EBUSY && ret != -ETIMEDOUT)
-		VDBG_BO(bo, "failed flags 0x%08X timeout_us %u err %d (%s)\n",
-			flags, timeout_us, ret, strerror(-ret));
-	else
-		VDBG_BO(bo, "%s flags 0x%08X timeout_us %u\n",
-			ret ? "busy" : "idling", flags, timeout_us);
-
-	return ret;
-}
-
 static enum drm_tegra_soc_id read_chip_id(const char *path)
 {
 	FILE *file = fopen(path, "r");

@@ -175,41 +175,23 @@ static struct drm_tegra_bo_bucket * bo_bucket(struct drm_tegra_bo *bo)
 	return drm_tegra_get_bucket(bo->drm, bo->size);
 }
 
-static bool is_idle(struct drm_tegra_bo *bo)
-{
-	bool ret;
-
-	VG_BO_OBTAIN(bo);
-
-	ret = drm_tegra_bo_cpu_prep(bo, DRM_TEGRA_CPU_PREP_WRITE, 0) != -EBUSY;
-
-	VG_BO_RELEASE(bo);
-
-	return ret;
-}
-
 static struct drm_tegra_bo *find_in_bucket(struct drm_tegra_bo_bucket *bucket,
 					   uint32_t flags)
 {
 	struct drm_tegra_bo *bo = NULL;
 
-	/* TODO .. if we had an ALLOC_FOR_RENDER flag like intel, we could
-	 * skip the busy check.. if it is only going to be a render target
-	 * then we probably don't need to stall..
-	 *
-	 * NOTE that intel takes ALLOC_FOR_RENDER bo's from the list tail
-	 * (MRU, since likely to be in GPU cache), rather than head (LRU)..
+	/*
+	 * A BO only reaches the cache when its last reference goes, and the
+	 * driver keeps a reference to every BO a submitted job uses until the
+	 * job has completed: a cached BO is idle. Exported and imported BOs
+	 * are never cached.
 	 */
 	if (!list_is_empty(&bucket->list)) {
 		bo = list_entry(bucket->list.next, struct drm_tegra_bo,
 				bo_list);
 		/* TODO check for compatible flags? */
-		if (is_idle(bo)) {
-			list_delinit(&bo->bo_list);
-			bucket->num_entries--;
-		} else {
-			bo = NULL;
-		}
+		list_delinit(&bo->bo_list);
+		bucket->num_entries--;
 	}
 
 	return bo;
