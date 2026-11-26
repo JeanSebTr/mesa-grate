@@ -10,7 +10,10 @@
 #include "util/disk_cache.h"
 #include "util/mesa-blake3.h"
 #include "util/os_file.h"
+#include "util/u_inlines.h"
+#include "util/u_math.h"
 #include "util/u_memory.h"
+#include "util/os_time.h"
 #include "util/u_screen.h"
 
 #include "grate_common.h"
@@ -254,12 +257,42 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
    return true;
 }
 
+/* a 3D job's syncpoint threshold; no job (NULL): already signalled */
+struct grate_fence {
+   struct pipe_reference reference;
+   struct drm_tegra_fence *fence;
+};
+
+struct pipe_fence_handle *
+grate_fence_create(struct drm_tegra_fence *fence)
+{
+   struct grate_fence *f = CALLOC_STRUCT(grate_fence);
+
+   if (!f) {
+      if (fence) {
+         drm_tegra_fence_wait(fence);
+         drm_tegra_fence_free(fence);
+      }
+      return NULL;
+   }
+   pipe_reference_init(&f->reference, 1);
+   f->fence = fence;
+   return (struct pipe_fence_handle *)f;
+}
+
 static void
 grate_screen_fence_reference(struct pipe_screen *pscreen,
                              struct pipe_fence_handle **ptr,
                              struct pipe_fence_handle *fence)
 {
-   /* fences are a static dummy, see grate_context_flush() */
+   struct grate_fence *old = (struct grate_fence *)*ptr;
+   struct grate_fence *f = (struct grate_fence *)fence;
+
+   if (pipe_reference(old ? &old->reference : NULL, f ? &f->reference : NULL)) {
+      if (old->fence)
+         drm_tegra_fence_free(old->fence);
+      FREE(old);
+   }
    *ptr = fence;
 }
 
@@ -269,6 +302,22 @@ grate_screen_fence_finish(struct pipe_screen *screen,
                           struct pipe_fence_handle *fence,
                           uint64_t timeout)
 {
+   struct grate_fence *f = (struct grate_fence *)fence;
+   unsigned long ms;
+
+   if (!f || !f->fence)
+      return true;
+
+   if (timeout == OS_TIMEOUT_INFINITE)
+      ms = ~0ul;
+   else
+      ms = DIV_ROUND_UP(timeout, 1000000);
+
+   if (drm_tegra_fence_wait_timeout(f->fence, ms))
+      return false;
+
+   drm_tegra_fence_free(f->fence);
+   f->fence = NULL;
    return true;
 }
 

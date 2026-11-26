@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -83,22 +84,56 @@ grate_stream_destroy(struct grate_stream *stream)
    if (!stream)
       return;
 
+   grate_stream_finish(stream);
    drm_tegra_job_free(stream->job);
+   for (unsigned i = 0; i < stream->num_bos; i++)
+      drm_tegra_bo_unref(stream->bos[i]);
+   free(stream->bos);
+}
+
+/* Wait for the oldest submitted job, then release what it held. */
+static int
+grate_stream_retire(struct grate_stream *stream, unsigned long timeout)
+{
+   struct grate_inflight_job *oldest = &stream->inflight[0];
+   int result = 0;
+
+   if (!stream->num_inflight)
+      return 0;
+
+   if (oldest->fence) {
+      result = drm_tegra_fence_wait_timeout(oldest->fence, timeout);
+      if (result == -EAGAIN && !timeout)
+         return result; /* still running */
+      if (result != 0)
+         ErrorMsg("drm_tegra_fence_wait_timeout() failed %d\n", result);
+      drm_tegra_fence_free(oldest->fence);
+   }
+
+   drm_tegra_job_free(oldest->job);
+   for (unsigned i = 0; i < oldest->num_bos; i++)
+      drm_tegra_bo_unref(oldest->bos[i]);
+   free(oldest->bos);
+
+   stream->num_inflight--;
+   memmove(&stream->inflight[0], &stream->inflight[1],
+           stream->num_inflight * sizeof(stream->inflight[0]));
+
+   return result ? -1 : 0;
 }
 
 /*
- * grate_stream_flush(stream, fence)
+ * grate_stream_submit(stream)
  *
- * Send the current contents of stream buffer. The stream must be
- * synchronized correctly (we cannot send partial streams). If
- * pointer to fence is given, the fence will contain the syncpoint value
- * that is reached when operations in the buffer are finished.
+ * Send the pending job to the GPU without waiting for it. The job keeps its
+ * BOs referenced until grate_stream_finish() or a later submission sees it
+ * completed.
  */
-
 int
-grate_stream_flush(struct grate_stream *stream)
+grate_stream_submit(struct grate_stream *stream)
 {
-   struct drm_tegra_fence *fence;
+   struct drm_tegra_fence *fence = NULL;
+   struct grate_inflight_job *slot;
    int result = 0;
 
    if (!stream)
@@ -111,48 +146,92 @@ grate_stream_flush(struct grate_stream *stream)
    /* Return error if stream is constructed badly */
    if (stream->status != GRATE_STREAM_READY) {
       result = -1;
-      goto cleanup;
+   } else {
+      result = drm_tegra_job_submit(stream->job, &fence);
+      if (result != 0) {
+         ErrorMsg("drm_tegra_job_submit() failed %d\n", result);
+         result = -1;
+         fence = NULL;
+      }
    }
 
-   result = drm_tegra_job_submit(stream->job, &fence);
-   if (result != 0) {
-      ErrorMsg("drm_tegra_job_submit() failed %d\n", result);
-      result = -1;
-      goto cleanup;
-   }
+   /* release the jobs that are done, and make room for this one */
+   while (stream->num_inflight && grate_stream_retire(stream, 0) == 0)
+      ;
+   if (stream->num_inflight == GRATE_STREAM_MAX_INFLIGHT)
+      grate_stream_retire(stream, 1000);
 
-   result = drm_tegra_fence_wait_timeout(fence, 1000);
-   if (result != 0) {
-      ErrorMsg("drm_tegra_fence_wait_timeout() failed %d\n", result);
-      result = -1;
-   }
+   slot = &stream->inflight[stream->num_inflight++];
+   slot->job = stream->job;
+   slot->fence = fence;
+   slot->bos = stream->bos;
+   slot->num_bos = stream->num_bos;
+   slot->max_bos = stream->max_bos;
 
-   drm_tegra_fence_free(fence);
-
-cleanup:
-   drm_tegra_job_free(stream->job);
-
-   for (unsigned i = 0; i < stream->num_bos; i++)
-      drm_tegra_bo_unref(stream->bos[i]);
-   stream->num_bos = 0;
+   stream->bos = NULL;
+   stream->num_bos = stream->max_bos = 0;
    stream->num_draws = 0;
-
    stream->job = NULL;
    stream->status = GRATE_STREAM_FREE;
 
    return result;
 }
 
-/* the job being built or pending references bo */
-bool
-grate_stream_references(const struct grate_stream *stream,
-                        const struct drm_tegra_bo *bo)
+struct drm_tegra_fence *
+grate_stream_last_fence(const struct grate_stream *stream)
 {
-   if (stream->status == GRATE_STREAM_FREE)
-      return false;
+   for (int i = (int)stream->num_inflight - 1; i >= 0; i--)
+      if (stream->inflight[i].fence)
+         return drm_tegra_fence_dup(stream->inflight[i].fence);
+   return NULL;
+}
+
+/*
+ * grate_stream_finish(stream)
+ *
+ * Wait for every submitted job to complete.
+ */
+int
+grate_stream_finish(struct grate_stream *stream)
+{
+   int result = 0;
+
+   while (stream->num_inflight)
+      if (grate_stream_retire(stream, 1000))
+         result = -1;
+
+   return result;
+}
+
+/*
+ * grate_stream_flush(stream)
+ *
+ * Submit the pending job and wait for it, and for every job before it.
+ */
+int
+grate_stream_flush(struct grate_stream *stream)
+{
+   int result = grate_stream_submit(stream);
+
+   if (stream && grate_stream_finish(stream))
+      result = -1;
+
+   return result;
+}
+
+bool
+grate_stream_busy(const struct grate_stream *stream,
+                  const struct drm_tegra_bo *bo)
+{
    for (unsigned i = 0; i < stream->num_bos; i++)
       if (stream->bos[i] == bo)
          return true;
+
+   for (unsigned j = 0; j < stream->num_inflight; j++)
+      for (unsigned i = 0; i < stream->inflight[j].num_bos; i++)
+         if (stream->inflight[j].bos[i] == bo)
+            return true;
+
    return false;
 }
 

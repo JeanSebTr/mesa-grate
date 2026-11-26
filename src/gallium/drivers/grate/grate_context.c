@@ -62,7 +62,7 @@ grate_context_destroy(struct pipe_context *pcontext)
 {
    struct grate_context *context = grate_context(pcontext);
 
-   grate_flush_3d(context);
+   grate_finish_3d(context);
 
    for (int i = 0; i < GRATE_FP_MAX_SPILL_SLOTS; i++)
       if (context->spill_bo[i])
@@ -78,8 +78,16 @@ grate_context_destroy(struct pipe_context *pcontext)
    FREE(context);
 }
 
+/* Send the pending 3D job to the GPU, without waiting for it. */
 void
 grate_flush_3d(struct grate_context *context)
+{
+   grate_stream_submit(&context->gr3d->stream);
+}
+
+/* Send the pending 3D job and wait for all 3D work to complete. */
+void
+grate_finish_3d(struct grate_context *context)
 {
    grate_stream_flush(&context->gr3d->stream);
 }
@@ -89,16 +97,19 @@ grate_context_flush(struct pipe_context *pcontext,
                     struct pipe_fence_handle **pfence,
                     enum pipe_flush_flags flags)
 {
+   struct grate_context *context = grate_context(pcontext);
+
    /*
-    * Every submission waits for its job to complete (grate_stream_flush()),
-    * so all work is done by now and a fence is always signalled.
+    * Submit the pending 3D job without waiting for it: the fence is the
+    * newest job's syncpoint threshold. 3D jobs run in order on the one
+    * channel, so it covers every job before too.
     */
-   static int signalled_fence;
+   grate_flush_3d(context);
 
-   grate_flush_3d(grate_context(pcontext));
-
-   if (pfence)
-      *pfence = (struct pipe_fence_handle *)&signalled_fence;
+   if (pfence) {
+      pcontext->screen->fence_reference(pcontext->screen, pfence, NULL);
+      *pfence = grate_fence_create(grate_stream_last_fence(&context->gr3d->stream));
+   }
 }
 
 struct pipe_context *

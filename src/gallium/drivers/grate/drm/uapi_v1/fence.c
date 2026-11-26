@@ -46,6 +46,15 @@ int drm_tegra_fence_wait_timeout(struct drm_tegra_fence *fence,
 				   &args, sizeof(args));
 }
 
+struct drm_tegra_fence *drm_tegra_fence_dup(const struct drm_tegra_fence *fence)
+{
+	struct drm_tegra_fence *dup = malloc(sizeof(*dup));
+
+	if (dup)
+		*dup = *fence;
+	return dup;
+}
+
 void drm_tegra_fence_free(struct drm_tegra_fence *fence)
 {
 	free(fence);

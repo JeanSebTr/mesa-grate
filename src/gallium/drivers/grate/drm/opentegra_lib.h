@@ -145,6 +145,7 @@ int drm_tegra_pushbuf_sync(struct drm_tegra_pushbuf *pushbuf,
 int drm_tegra_fence_wait_timeout(struct drm_tegra_fence *fence,
 				 unsigned long timeout);
 void drm_tegra_fence_free(struct drm_tegra_fence *fence);
+struct drm_tegra_fence *drm_tegra_fence_dup(const struct drm_tegra_fence *fence);
 
 static inline int drm_tegra_fence_wait(struct drm_tegra_fence *fence)
 {
