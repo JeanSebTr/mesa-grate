@@ -46,6 +46,7 @@ int drm_tegra_pushbuf_queue(struct drm_tegra_pushbuf_private *pushbuf)
 	struct drm_tegra_cmdbuf cmdbuf;
 	int err;
 
+	/* channel UAPI: the commands stay in pushbuf->words until the submit */
 	if (!pushbuf || !pushbuf->bo)
 		return 0;
 
@@ -116,6 +117,7 @@ int drm_tegra_pushbuf_free(struct drm_tegra_pushbuf *pushbuf)
 	}
 
 	list_del(&priv->list);
+	free(priv->words);
 	free(priv);
 
 	return 0;
@@ -140,6 +142,27 @@ int drm_tegra_pushbuf_prepare(struct drm_tegra_pushbuf *pushbuf,
 
 	priv = drm_tegra_pushbuf(pushbuf);
 	channel = priv->job->channel;
+
+	if (channel->channel_uapi) {
+		size_t used, size;
+		uint32_t *grown;
+
+		if (priv->words && pushbuf->ptr + words < priv->end)
+			return 0;
+
+		/* the kernel copies the commands in: one growing array */
+		used = priv->words ? pushbuf->ptr - priv->start : 0;
+		size = ALIGN_POT(used + words, 1024);
+		grown = realloc(priv->words, size * sizeof(uint32_t));
+		if (!grown)
+			return -ENOMEM;
+
+		priv->words = priv->start = grown;
+		priv->base.ptr = grown + used;
+		priv->end = grown + size;
+
+		return 0;
+	}
 
 	if (priv->bo && (pushbuf->ptr + words < priv->end))
 		return 0;
@@ -195,13 +218,13 @@ int drm_tegra_pushbuf_relocate(struct drm_tegra_pushbuf *pushbuf,
 		return err;
 
 	memset(&reloc, 0, sizeof(reloc));
-	reloc.cmdbuf.handle = priv->bo->handle;
+	reloc.cmdbuf.handle = priv->bo ? priv->bo->handle : 0;
 	reloc.cmdbuf.offset = drm_tegra_pushbuf_get_offset(pushbuf);
 	reloc.target.handle = target->handle;
 	reloc.target.offset = offset;
 	reloc.shift = shift;
 
-	err = drm_tegra_job_add_reloc(priv->job, &reloc);
+	err = drm_tegra_job_add_reloc(priv->job, &reloc, target);
 	if (err < 0)
 		return err;
 

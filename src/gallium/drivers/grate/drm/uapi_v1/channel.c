@@ -49,6 +49,47 @@ static int drm_tegra_channel_setup(struct drm_tegra_channel *channel)
 	return 0;
 }
 
+/*
+ * The channel UAPI: a channel context on the engine, and a syncpoint of our
+ * own for its jobs. Fails with -ENOTTY (or -EINVAL on older kernels) when the
+ * kernel doesn't offer it.
+ */
+static int drm_tegra_channel_open_uapi(struct drm_tegra_channel *channel)
+{
+	struct drm_tegra *drm = channel->drm;
+	struct drm_tegra_channel_open open_args;
+	struct drm_tegra_channel_close close_args;
+	struct drm_tegra_syncpoint_allocate sp_args;
+	int err;
+
+	memset(&open_args, 0, sizeof(open_args));
+	open_args.host1x_class = channel->class;
+
+	err = drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_OPEN, &open_args);
+	if (err < 0)
+		return err;
+
+	memset(&sp_args, 0, sizeof(sp_args));
+	err = drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_ALLOCATE, &sp_args);
+	if (err < 0) {
+		memset(&close_args, 0, sizeof(close_args));
+		close_args.context = open_args.context;
+		drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_CLOSE, &close_args);
+		return err;
+	}
+
+	channel->context = open_args.context;
+	channel->syncpt = sp_args.id;
+	channel->channel_uapi = true;
+
+	simple_mtx_lock(&drm->channel_lock);
+	channel->serial = ++drm->channel_serial;
+	list_addtail(&channel->link, &drm->channels);
+	simple_mtx_unlock(&drm->channel_lock);
+
+	return 0;
+}
+
 int drm_tegra_channel_open(struct drm_tegra_channel **channelp,
 			   struct drm_tegra *drm,
 			   enum drm_tegra_class client)
@@ -79,6 +120,22 @@ int drm_tegra_channel_open(struct drm_tegra_channel **channelp,
 		return -ENOMEM;
 
 	channel->drm = drm;
+	channel->class = class;
+
+	if (drm->uapi != DRM_TEGRA_UAPI_LEGACY) {
+		err = drm_tegra_channel_open_uapi(channel);
+		if (err == 0) {
+			drm->uapi = DRM_TEGRA_UAPI_CHANNEL;
+			*channelp = channel;
+			return 0;
+		}
+		if (drm->uapi == DRM_TEGRA_UAPI_CHANNEL ||
+		    (err != -ENOTTY && err != -EINVAL)) {
+			free(channel);
+			return err;
+		}
+		drm->uapi = DRM_TEGRA_UAPI_LEGACY;
+	}
 
 	memset(&args, 0, sizeof(args));
 	args.client = class;
@@ -114,6 +171,27 @@ int drm_tegra_channel_close(struct drm_tegra_channel *channel)
 		return -EINVAL;
 
 	drm = channel->drm;
+
+	if (channel->channel_uapi) {
+		struct drm_tegra_channel_close close_args;
+		struct drm_tegra_syncpoint_free sp_args;
+
+		/* its BO mappings go with the context */
+		simple_mtx_lock(&drm->channel_lock);
+		list_del(&channel->link);
+		simple_mtx_unlock(&drm->channel_lock);
+
+		memset(&close_args, 0, sizeof(close_args));
+		close_args.context = channel->context;
+		err = drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_CLOSE, &close_args);
+
+		memset(&sp_args, 0, sizeof(sp_args));
+		sp_args.id = channel->syncpt;
+		drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_FREE, &sp_args);
+
+		free(channel);
+		return err;
+	}
 
 	memset(&args, 0, sizeof(args));
 	args.context = channel->context;

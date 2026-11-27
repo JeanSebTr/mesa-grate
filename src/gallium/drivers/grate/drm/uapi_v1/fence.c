@@ -24,6 +24,8 @@
 
 #include <errno.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <xf86drm.h>
 
@@ -36,6 +38,29 @@ int drm_tegra_fence_wait_timeout(struct drm_tegra_fence *fence,
 
 	if (!fence)
 		return -EINVAL;
+
+	if (fence->channel_uapi) {
+		struct drm_tegra_syncpoint_wait wait;
+		struct timespec now;
+		int err;
+
+		/* an absolute CLOCK_MONOTONIC deadline; ~0: wait for ever */
+		memset(&wait, 0, sizeof(wait));
+		wait.id = fence->syncpt;
+		wait.threshold = fence->value;
+		if (timeout == ~0ul) {
+			wait.timeout_ns = INT64_MAX;
+		} else {
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			wait.timeout_ns = (int64_t)now.tv_sec * 1000000000ll +
+					  now.tv_nsec + (int64_t)timeout * 1000000ll;
+		}
+
+		err = drm_tegra_ioctl(fence->drm->fd,
+				      DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &wait);
+		/* a wait that times out reports -EAGAIN, as the legacy one */
+		return err == -ETIMEDOUT ? -EAGAIN : err;
+	}
 
 	memset(&args, 0, sizeof(args));
 	args.id = fence->syncpt;

@@ -32,12 +32,18 @@ struct drm_tegra_channel {
 	enum host1x_class class;
 	uint64_t context;
 	uint32_t syncpt;
+
+	/* channel UAPI: entry in drm->channels, and the ID BO mappings use */
+	bool channel_uapi;
+	struct list_head link;
+	uint32_t serial;
 };
 
 struct drm_tegra_fence {
 	struct drm_tegra *drm;
 	uint32_t syncpt;
 	uint32_t value;
+	bool channel_uapi;
 };
 
 struct drm_tegra_pushbuf_private {
@@ -49,6 +55,8 @@ struct drm_tegra_pushbuf_private {
 	struct drm_tegra_bo *bo;
 	uint32_t *start;
 	uint32_t *end;
+	/* channel UAPI: the commands, in memory the kernel copies them from */
+	uint32_t *words;
 };
 
 static inline struct drm_tegra_pushbuf_private *
@@ -69,6 +77,8 @@ struct drm_tegra_job {
 
 	struct drm_tegra_reloc *relocs;
 	unsigned int num_relocs;
+	/* channel UAPI: the target BO of each relocation */
+	struct drm_tegra_bo **reloc_bos;
 
 	struct drm_tegra_cmdbuf *cmdbufs;
 	unsigned int num_cmdbufs;
@@ -78,7 +88,8 @@ struct drm_tegra_job {
 };
 
 int drm_tegra_job_add_reloc(struct drm_tegra_job *job,
-			    const struct drm_tegra_reloc *reloc);
+			    const struct drm_tegra_reloc *reloc,
+			    struct drm_tegra_bo *target);
 int drm_tegra_job_add_cmdbuf(struct drm_tegra_job *job,
 			     const struct drm_tegra_cmdbuf *cmdbuf);
 
