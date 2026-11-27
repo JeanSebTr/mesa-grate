@@ -79,6 +79,8 @@ struct drm_tegra_job {
 	unsigned int num_relocs;
 	/* channel UAPI: the target BO of each relocation */
 	struct drm_tegra_bo **reloc_bos;
+	/* channel UAPI: syncobjs to wait for and to put the job's fence in */
+	uint32_t syncobj_in, syncobj_out;
 
 	struct drm_tegra_cmdbuf *cmdbufs;
 	unsigned int num_cmdbufs;

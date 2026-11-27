@@ -38,4 +38,8 @@ struct drm_tegra_fence;
 struct pipe_fence_handle *
 grate_fence_create(struct drm_tegra_fence *fence);
 
+/* takes ownership of fence and fd (-1: none) */
+struct pipe_fence_handle *
+grate_fence_create_fd(struct drm_tegra_fence *fence, int fd);
+
 #endif

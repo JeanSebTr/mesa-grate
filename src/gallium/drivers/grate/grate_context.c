@@ -1,6 +1,9 @@
 #include <errno.h>
 #include <stdio.h>
+#include <unistd.h>
 
+#include "util/os_file.h"
+#include "util/os_time.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
 
@@ -107,8 +110,39 @@ grate_context_flush(struct pipe_context *pcontext,
    grate_flush_3d(context);
 
    if (pfence) {
+      struct grate_stream *s = &context->gr3d->stream;
+
       pcontext->screen->fence_reference(pcontext->screen, pfence, NULL);
-      *pfence = grate_fence_create(grate_stream_last_fence(&context->gr3d->stream));
+      *pfence = grate_fence_create_fd(grate_stream_last_fence(s),
+                                      grate_stream_export_fence(s));
+   }
+}
+
+/* a fence from a sync file: another driver's or process' work */
+static void
+grate_context_create_fence_fd(struct pipe_context *pcontext,
+                              struct pipe_fence_handle **pfence,
+                              int fd, enum pipe_fd_type type)
+{
+   assert(type == PIPE_FD_TYPE_NATIVE_SYNC);
+   *pfence = grate_fence_create_fd(NULL, os_dupfd_cloexec(fd));
+}
+
+/* make the GPU work that follows wait for the fence */
+static void
+grate_context_fence_server_sync(struct pipe_context *pcontext,
+                                struct pipe_fence_handle *pfence,
+                                uint64_t value)
+{
+   struct grate_context *context = grate_context(pcontext);
+   int fd = pcontext->screen->fence_get_fd(pcontext->screen, pfence);
+
+   if (fd >= 0) {
+      grate_stream_wait_for(&context->gr3d->stream, fd);
+      close(fd);
+   } else {
+      pcontext->screen->fence_finish(pcontext->screen, pcontext, pfence,
+                                     OS_TIMEOUT_INFINITE);
    }
 }
 
@@ -148,6 +182,8 @@ grate_screen_context_create(struct pipe_screen *pscreen,
 
    context->base.destroy = grate_context_destroy;
    context->base.flush = grate_context_flush;
+   context->base.create_fence_fd = grate_context_create_fence_fd;
+   context->base.fence_server_sync = grate_context_fence_server_sync;
    context->base.stream_uploader = u_upload_create_default(&context->base);
    context->base.const_uploader = context->base.stream_uploader;
 

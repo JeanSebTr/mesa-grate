@@ -76,6 +76,13 @@ int drm_tegra_job_add_cmdbuf(struct drm_tegra_job *job,
 	return 0;
 }
 
+void drm_tegra_job_set_syncobjs(struct drm_tegra_job *job,
+				uint32_t syncobj_in, uint32_t syncobj_out)
+{
+	job->syncobj_in = syncobj_in;
+	job->syncobj_out = syncobj_out;
+}
+
 int drm_tegra_job_new(struct drm_tegra_job **jobp,
 		      struct drm_tegra_channel *channel)
 {
@@ -175,6 +182,8 @@ static int drm_tegra_job_submit_uapi(struct drm_tegra_job *job,
 	args.gather_data_ptr = (uintptr_t)pushbuf->start;
 	args.syncpt.id = job->syncpt;
 	args.syncpt.increments = job->increments;
+	args.syncobj_in = job->syncobj_in;
+	args.syncobj_out = job->syncobj_out;
 
 	err = drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, &args);
 	if (err < 0)
