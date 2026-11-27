@@ -30,7 +30,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <errno.h>
 #include <time.h>
+
+#include <xf86drm.h>
 
 #include <sys/mman.h>
 
@@ -88,6 +91,24 @@
 #define DBG_BO(BO, FMT)		do {} while (0)
 #endif
 
+/* an ioctl, returning 0 or -errno */
+static inline int drm_tegra_ioctl(int fd, unsigned long request, void *arg)
+{
+	return drmIoctl(fd, request, arg) ? -errno : 0;
+}
+
+#define DRM_TEGRA_UAPI_LEGACY	1
+#define DRM_TEGRA_UAPI_CHANNEL	2
+
+struct drm_tegra_bo_mapping {
+	uint32_t channel_serial;	/* the channel it was made for */
+	uint32_t id;			/* the kernel's mapping ID */
+};
+
+int drm_tegra_bo_channel_map(struct drm_tegra_bo *bo,
+			     struct drm_tegra_channel *channel, uint32_t *id);
+void drm_tegra_bo_channel_unmap_all(struct drm_tegra_bo *bo);
+
 enum host1x_class {
 	HOST1X_CLASS_HOST1X = 0x01,
 	HOST1X_CLASS_GR2D = 0x51,
@@ -132,6 +153,17 @@ struct drm_tegra {
 	bool close;
 	int fd;
 
+	/*
+	 * Which submission interface the kernel offers: 0 not known yet,
+	 * DRM_TEGRA_UAPI_LEGACY (CONFIG_DRM_TEGRA_STAGING) or
+	 * DRM_TEGRA_UAPI_CHANNEL (channel open/map/submit).
+	 */
+	int uapi;
+	/* channel UAPI: the open channels, and the lock for them and BO mappings */
+	struct list_head channels;
+	uint32_t channel_serial;
+	simple_mtx_t channel_lock;
+
 #ifndef NDEBUG
 	bool debug_bo;
 	bool debug_bo_back_guard;
@@ -163,6 +195,10 @@ struct drm_tegra_bo {
 #endif
 
 	bool reuse;
+
+	/* channel UAPI: this BO's mapping in each channel that used it */
+	struct drm_tegra_bo_mapping *mappings;
+	unsigned int num_mappings;
 	/*
 	 * Cache-accessible fields must be at the end of structure
 	 * due to protection of the rest of the fields by valgrind.

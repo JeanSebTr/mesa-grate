@@ -30,6 +30,7 @@
 #include <xf86drm.h>
 
 #include "private.h"
+#include "uapi_v1/uapi_v1.h"
 
 static simple_mtx_t table_lock = SIMPLE_MTX_INITIALIZER;
 
@@ -197,6 +198,112 @@ static void drm_tegra_bo_unmap_guards(struct drm_tegra_bo *bo)
 #endif
 }
 
+/* the open channel with that serial, or NULL; call with channel_lock held */
+static struct drm_tegra_channel *
+drm_tegra_find_channel(struct drm_tegra *drm, uint32_t serial)
+{
+	struct drm_tegra_channel *channel;
+
+	LIST_FOR_EACH_ENTRY(channel, &drm->channels, link)
+		if (channel->serial == serial)
+			return channel;
+
+	return NULL;
+}
+
+/*
+ * The ID of the BO's mapping in a channel, mapping it the first time the
+ * channel uses it. The mapping lasts until the BO is freed (the BO cache
+ * keeps it) or the channel is closed.
+ */
+int drm_tegra_bo_channel_map(struct drm_tegra_bo *bo,
+			     struct drm_tegra_channel *channel, uint32_t *id)
+{
+	struct drm_tegra *drm = bo->drm;
+	struct drm_tegra_bo_mapping *mappings;
+	struct drm_tegra_channel_map args;
+	unsigned int i, n = 0;
+	int err;
+
+	simple_mtx_lock(&drm->channel_lock);
+
+	for (i = 0; i < bo->num_mappings; i++) {
+		if (bo->mappings[i].channel_serial == channel->serial) {
+			*id = bo->mappings[i].id;
+			simple_mtx_unlock(&drm->channel_lock);
+			return 0;
+		}
+		/* forget mappings of closed channels */
+		if (drm_tegra_find_channel(drm, bo->mappings[i].channel_serial))
+			bo->mappings[n++] = bo->mappings[i];
+	}
+	bo->num_mappings = n;
+
+	memset(&args, 0, sizeof(args));
+	args.context = channel->context;
+	args.handle = bo->handle;
+	args.flags = DRM_TEGRA_CHANNEL_MAP_READ_WRITE;
+
+	err = drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_MAP, &args);
+	if (err < 0)
+		goto unlock;
+
+	mappings = realloc(bo->mappings, (n + 1) * sizeof(*mappings));
+	if (!mappings) {
+		struct drm_tegra_channel_unmap unmap = {
+			.context = channel->context,
+			.mapping = args.mapping,
+		};
+
+		drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_UNMAP, &unmap);
+		err = -ENOMEM;
+		goto unlock;
+	}
+
+	mappings[n].channel_serial = channel->serial;
+	mappings[n].id = args.mapping;
+	bo->mappings = mappings;
+	bo->num_mappings = n + 1;
+	*id = args.mapping;
+
+unlock:
+	simple_mtx_unlock(&drm->channel_lock);
+	return err;
+}
+
+/* drop the BO's mappings in the channels that are still open */
+void drm_tegra_bo_channel_unmap_all(struct drm_tegra_bo *bo)
+{
+	struct drm_tegra *drm = bo->drm;
+	struct drm_tegra_channel *channel;
+	unsigned int i;
+
+	if (!bo->num_mappings)
+		goto out;
+
+	simple_mtx_lock(&drm->channel_lock);
+
+	for (i = 0; i < bo->num_mappings; i++) {
+		struct drm_tegra_channel_unmap args;
+
+		channel = drm_tegra_find_channel(drm, bo->mappings[i].channel_serial);
+		if (!channel)
+			continue;
+
+		memset(&args, 0, sizeof(args));
+		args.context = channel->context;
+		args.mapping = bo->mappings[i].id;
+		drm_tegra_ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_UNMAP, &args);
+	}
+
+	simple_mtx_unlock(&drm->channel_lock);
+
+out:
+	free(bo->mappings);
+	bo->mappings = NULL;
+	bo->num_mappings = 0;
+}
+
 int drm_tegra_bo_free(struct drm_tegra_bo *bo)
 {
 	struct drm_tegra *drm = bo->drm;
@@ -242,6 +349,8 @@ vg_free:
 		drmHashDelete(drm->name_table, bo->name);
 
 	drmHashDelete(drm->handle_table, bo->handle);
+
+	drm_tegra_bo_channel_unmap_all(bo);
 
 	memset(&args, 0, sizeof(args));
 	args.handle = bo->handle;
@@ -295,6 +404,9 @@ static int drm_tegra_wrap(struct drm_tegra **drmp, int fd, bool close,
 	drm->fd = fd;
 
 	drm_tegra_bo_cache_init(&drm->bo_cache, false);
+	list_inithead(&drm->channels);
+	simple_mtx_init(&drm->channel_lock, mtx_plain);
+
 	drm->handle_table = drmHashCreate();
 	drm->name_table = drmHashCreate();
 	list_inithead(&drm->mmap_cache.list);
