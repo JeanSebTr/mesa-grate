@@ -3971,6 +3971,226 @@ collapse_affine_chains(nir_shader *s)
    NIR_PASS(_, s, nir_opt_dce);
 }
 
+/*
+ * Decal sampling done in the shader (no clamp-to-border in the texture unit),
+ * as Skia's blurs do for every tap: each texel t is pulled towards the border
+ * colour B by how far the coordinate fell outside, once per axis, and the
+ * taps are summed with kernel weights K:
+ *
+ *    m = t + fx * (B - t);   m = m + fy * (B - m);   acc += K * m
+ *
+ * That is acc = sum K * (B + w * (t - B)) with w = (1 - fx) (1 - fy), or
+ *
+ *    acc = sum a * (t - B) + B * sum K,   a = K * w,
+ *
+ * where a is one scalar per tap, shared by the four channels, and B * sum K
+ * is uniform: per channel a tap costs a subtraction and a MAD instead of
+ * five operations, with no more values live across taps than before.
+ */
+#define DECAL_MAX_TAPS 64
+#define DECAL_MAX_AXES 4
+
+/* v = t pulled towards b by f[] (innermost first); false if v isn't one */
+static bool
+decal_term(nir_scalar v, nir_scalar *t, nir_scalar *border, nir_scalar *f,
+           int *nf)
+{
+   *nf = 0;
+   while (nir_scalar_is_alu(v) && nir_scalar_alu_op(v) == nir_op_ffma &&
+          *nf < DECAL_MAX_AXES) {
+      nir_scalar x = nir_scalar_chase_alu_src(v, 2);
+      bool found = false;
+      for (int i = 0; i < 2 && !found; i++) {
+         nir_scalar d = nir_scalar_chase_alu_src(v, i);
+         if (!nir_scalar_is_alu(d) || nir_scalar_alu_op(d) != nir_op_fadd)
+            continue;
+         for (int j = 0; j < 2 && !found; j++) {
+            nir_scalar n = nir_scalar_chase_alu_src(d, j);
+            nir_scalar bb = nir_scalar_chase_alu_src(d, 1 - j);
+            if (!nir_scalar_is_alu(n) || nir_scalar_alu_op(n) != nir_op_fneg ||
+                !nir_scalar_equal(nir_scalar_chase_alu_src(n, 0), x))
+               continue;
+            if (*nf && !nir_scalar_equal(bb, *border))
+               continue;
+            *border = bb;
+            f[(*nf)++] = nir_scalar_chase_alu_src(v, 1 - i);
+            found = true;
+         }
+      }
+      if (!found)
+         break;
+      v = x;
+   }
+   *t = v;
+   return *nf > 0;
+}
+
+/* one tap of an accumulation: k * term, with term a decal_term() */
+static bool
+decal_tap(nir_scalar a, nir_scalar b, nir_scalar *k, nir_scalar *t,
+          nir_scalar *border, nir_scalar *f, int *nf)
+{
+   nir_scalar bb;
+   if (decal_term(b, t, &bb, f, nf)) {
+      *k = a;
+   } else if (decal_term(a, t, &bb, f, nf)) {
+      *k = b;
+   } else {
+      return false;
+   }
+   *border = bb;
+   return true;
+}
+
+struct decal_tap {
+   nir_scalar k, t, f[DECAL_MAX_AXES];
+   int nf;
+   nir_instr *step;   /* the tap's accumulation, then the last of its values */
+};
+
+struct decal_taps {
+   int n;
+   nir_scalar border;
+   struct decal_tap tap[DECAL_MAX_TAPS];
+};
+
+/* v = sum of K * decal terms with one border colour, outermost tap first */
+static bool
+decal_sum(nir_scalar v, struct decal_taps *d)
+{
+   d->n = 0;
+   for (;;) {
+      if (!nir_scalar_is_alu(v) || d->n == DECAL_MAX_TAPS)
+         return false;
+      nir_op op = nir_scalar_alu_op(v);
+      if (op != nir_op_ffma && op != nir_op_fmul)
+         return false;
+      nir_scalar border;
+      struct decal_tap *tp = &d->tap[d->n];
+      if (!decal_tap(nir_scalar_chase_alu_src(v, 0),
+                     nir_scalar_chase_alu_src(v, 1), &tp->k, &tp->t, &border,
+                     tp->f, &tp->nf))
+         return false;
+      if (d->n && !nir_scalar_equal(border, d->border))
+         return false;
+      d->border = border;
+      tp->step = nir_def_instr(v.def);
+      d->n++;
+      if (op == nir_op_fmul)
+         return d->n >= 2;
+      v = nir_scalar_chase_alu_src(v, 2);
+   }
+}
+
+/* whether def is the addend of a further tap (not the end of its sum) */
+static bool
+decal_sum_continues(nir_def *def)
+{
+   nir_foreach_use(src, def) {
+      nir_instr *user = nir_src_parent_instr(src);
+      if (user->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *alu = nir_instr_as_alu(user);
+      if (alu->op == nir_op_ffma && src == &alu->src[2].src)
+         return true;
+   }
+   return false;
+}
+
+static bool
+fold_decal_sum(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_ffma || alu->def.num_components != 1 ||
+       decal_sum_continues(&alu->def))
+      return false;
+   struct decal_taps *d = data;
+   if (!decal_sum(nir_get_scalar(&alu->def, 0), d))
+      return false;
+
+   /* the taps go where their values are: all in the sum's block */
+   nir_block *block = alu->instr.block;
+   for (int i = 0; i < d->n; i++) {
+      if (d->tap[i].step->block != block ||
+          nir_def_instr(d->tap[i].t.def)->block != block)
+         return false;
+      for (int j = 0; j < d->tap[i].nf; j++)
+         if (nir_def_instr(d->tap[i].f[j].def)->block != block)
+            return false;
+   }
+
+   /*
+    * Each tap right after the last of its values (its texel, as a rule), in
+    * program order, so that the texel dies there; the border's share
+    * (uniform) goes in at the end, where all the kernel weights are loaded.
+    */
+   nir_function_impl *impl = nir_cf_node_get_function(&alu->instr.block->cf_node);
+   nir_index_instrs(impl);
+   for (int i = 0; i < d->n; i++) {
+      nir_instr *last = nir_def_instr(d->tap[i].t.def);
+      for (int j = 0; j < d->tap[i].nf; j++) {
+         nir_instr *in = nir_def_instr(d->tap[i].f[j].def);
+         if (in->index > last->index)
+            last = in;
+      }
+      nir_instr *k = nir_def_instr(d->tap[i].k.def);
+      if (k->block == block && k->index > last->index)
+         last = k;
+      d->tap[i].step = last;
+   }
+   /* program order of the taps' last values */
+   for (int i = 1; i < d->n; i++)
+      for (int j = i; j > 0 && d->tap[j - 1].step->index > d->tap[j].step->index; j--) {
+         struct decal_tap tmp = d->tap[j];
+         d->tap[j] = d->tap[j - 1];
+         d->tap[j - 1] = tmp;
+      }
+   nir_def *acc = NULL;
+   for (int i = 0; i < d->n; i++) {
+      b->cursor = nir_after_instr(d->tap[i].step);
+      nir_def *w = nir_fadd_imm(b, nir_fneg(b, nir_mov_scalar(b, d->tap[i].f[0])), 1.0);
+      for (int j = 1; j < d->tap[i].nf; j++)
+         w = nir_ffma(b, nir_fneg(b, nir_mov_scalar(b, d->tap[i].f[j])), w, w);
+      nir_def *a = nir_fmul(b, nir_mov_scalar(b, d->tap[i].k), w);
+      nir_def *t = nir_fadd(b, nir_mov_scalar(b, d->tap[i].t),
+                            nir_fneg(b, nir_mov_scalar(b, d->border)));
+      acc = acc ? nir_ffma(b, a, t, acc) : nir_fmul(b, a, t);
+   }
+   b->cursor = nir_after_instr(&alu->instr);
+   nir_def *ksum = NULL;
+   for (int i = d->n - 1; i >= 0; i--) {
+      nir_def *k = nir_mov_scalar(b, d->tap[i].k);
+      ksum = ksum ? nir_fadd(b, ksum, k) : k;
+   }
+   acc = nir_ffma(b, nir_mov_scalar(b, d->border), ksum, acc);
+   nir_def_rewrite_uses(&alu->def, acc);
+   return true;
+}
+
+DEBUG_GET_ONCE_BOOL_OPTION(decal_fold, "GRATE_DECAL_FOLD", true)
+
+static void
+fold_decal_sums(nir_shader *s)
+{
+   if (!debug_get_option_decal_fold())
+      return;
+
+   struct decal_taps *d = malloc(sizeof(*d));
+   if (!d)
+      return;
+   bool progress = false;
+   NIR_PASS(progress, s, nir_shader_alu_pass, fold_decal_sum,
+            nir_metadata_control_flow, d);
+   free(d);
+   if (progress) {
+      NIR_PASS(_, s, nir_opt_cse);
+      NIR_PASS(_, s, nir_opt_copy_prop);
+      NIR_PASS(_, s, nir_opt_dce);
+      NIR_PASS(_, s, nir_opt_algebraic_late);
+      NIR_PASS(_, s, nir_opt_cse);
+      NIR_PASS(_, s, nir_opt_dce);
+   }
+}
+
 /* time to draw a pixel, and a full-screen pass costs as much as a few */
 static int
 program_cost(struct grate_fp_shader *fps, int n)
@@ -4112,6 +4332,8 @@ grate_nir_to_fp(struct grate_fp_shader *fps, int *num_segments, nir_shader *s,
                 bool blended, const char **error)
 {
    const char *err = NULL;
+
+   fold_decal_sums(s);
 
    /*
     * One row without spilling first: every order. Then, with spilling,
