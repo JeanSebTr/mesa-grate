@@ -336,6 +336,9 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
    if (grate_stream_busy(s3d, dst->bo) || grate_stream_busy(s3d, src->bo))
       grate_finish_3d(gr2d->context);
 
+   /* 2D jobs don't take syncobjs: wait for client fences here */
+   grate_stream_wait_in_fence(&gr2d->context->gr3d->stream);
+
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {
       fprintf(stderr, "grate_stream_begin() failed: %d\n", err);
@@ -426,6 +429,9 @@ fill(struct grate_channel *gr2d,
    /* 2D jobs run at once: 3D work that uses dst first */
    if (grate_stream_busy(&gr2d->context->gr3d->stream, dst->bo))
       grate_finish_3d(gr2d->context);
+
+   /* 2D jobs don't take syncobjs: wait for client fences here */
+   grate_stream_wait_in_fence(&gr2d->context->gr3d->stream);
 
    err = grate_stream_begin(&gr2d->stream);
    if (err < 0) {

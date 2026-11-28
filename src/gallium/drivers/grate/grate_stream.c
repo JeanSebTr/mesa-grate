@@ -30,6 +30,10 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
+#include <xf86drm.h>
+
+#include "util/libsync.h"
+
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
@@ -68,6 +72,17 @@ grate_stream_create(struct drm_tegra *drm,
    stream->status    = GRATE_STREAM_FREE;
    stream->channel   = channel;
    stream->num_words = words_num;
+   stream->drm_fd    = drm_tegra_get_fd(drm);
+   stream->in_fence_fd = -1;
+
+   /* the out syncobj starts signalled: nothing was submitted yet */
+   if (drm_tegra_has_channel_uapi(drm) &&
+       drmSyncobjCreate(stream->drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
+                        &stream->syncobj_out) == 0 &&
+       drmSyncobjCreate(stream->drm_fd, 0, &stream->syncobj_in) != 0) {
+      drmSyncobjDestroy(stream->drm_fd, stream->syncobj_out);
+      stream->syncobj_out = 0;
+   }
 
    return 0;
 }
@@ -85,6 +100,12 @@ grate_stream_destroy(struct grate_stream *stream)
       return;
 
    grate_stream_finish(stream);
+   if (stream->in_fence_fd >= 0)
+      close(stream->in_fence_fd);
+   if (stream->syncobj_out) {
+      drmSyncobjDestroy(stream->drm_fd, stream->syncobj_out);
+      drmSyncobjDestroy(stream->drm_fd, stream->syncobj_in);
+   }
    drm_tegra_job_free(stream->job);
    for (unsigned i = 0; i < stream->num_bos; i++)
       drm_tegra_bo_unref(stream->bos[i]);
@@ -147,6 +168,18 @@ grate_stream_submit(struct grate_stream *stream)
    if (stream->status != GRATE_STREAM_READY) {
       result = -1;
    } else {
+      uint32_t syncobj_in = 0;
+
+      if (stream->syncobj_out && stream->in_fence_fd >= 0) {
+         if (drmSyncobjImportSyncFile(stream->drm_fd, stream->syncobj_in,
+                                      stream->in_fence_fd) == 0)
+            syncobj_in = stream->syncobj_in;
+         else
+            sync_wait(stream->in_fence_fd, -1);
+         close(stream->in_fence_fd);
+         stream->in_fence_fd = -1;
+      }
+      drm_tegra_job_set_syncobjs(stream->job, syncobj_in, stream->syncobj_out);
       result = drm_tegra_job_submit(stream->job, &fence);
       if (result != 0) {
          ErrorMsg("drm_tegra_job_submit() failed %d\n", result);
@@ -175,6 +208,34 @@ grate_stream_submit(struct grate_stream *stream)
    stream->status = GRATE_STREAM_FREE;
 
    return result;
+}
+
+int
+grate_stream_export_fence(struct grate_stream *stream)
+{
+   int fd = -1;
+
+   if (!stream->syncobj_out ||
+       drmSyncobjExportSyncFile(stream->drm_fd, stream->syncobj_out, &fd))
+      return -1;
+   return fd;
+}
+
+void
+grate_stream_wait_for(struct grate_stream *stream, int fd)
+{
+   if (fd >= 0)
+      sync_accumulate("grate", &stream->in_fence_fd, fd);
+}
+
+void
+grate_stream_wait_in_fence(struct grate_stream *stream)
+{
+   if (stream->in_fence_fd < 0)
+      return;
+   sync_wait(stream->in_fence_fd, -1);
+   close(stream->in_fence_fd);
+   stream->in_fence_fd = -1;
 }
 
 struct drm_tegra_fence *

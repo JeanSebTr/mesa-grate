@@ -444,6 +444,16 @@ int drm_tegra_new(struct drm_tegra **drmp, int fd)
 	return drm_tegra_wrap(drmp, fd, false, version_major);
 }
 
+int drm_tegra_get_fd(struct drm_tegra *drm)
+{
+	return drm->fd;
+}
+
+bool drm_tegra_has_channel_uapi(struct drm_tegra *drm)
+{
+	return drm->uapi == DRM_TEGRA_UAPI_CHANNEL;
+}
+
 void drm_tegra_close(struct drm_tegra *drm)
 {
 	if (!drm)

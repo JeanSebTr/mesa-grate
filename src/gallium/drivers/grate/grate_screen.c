@@ -10,6 +10,9 @@
 #include "util/disk_cache.h"
 #include "util/mesa-blake3.h"
 #include "util/os_file.h"
+#include <unistd.h>
+
+#include "util/libsync.h"
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -257,11 +260,28 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
    return true;
 }
 
-/* a 3D job's syncpoint threshold; no job (NULL): already signalled */
+/*
+ * A 3D job's syncpoint threshold (NULL: none, already signalled) and/or a
+ * sync file: the same job's fence when the kernel gives one (channel UAPI),
+ * or a fence imported from another driver or process.
+ */
 struct grate_fence {
    struct pipe_reference reference;
    struct drm_tegra_fence *fence;
+   int fd;
 };
+
+struct pipe_fence_handle *
+grate_fence_create_fd(struct drm_tegra_fence *fence, int fd)
+{
+   struct grate_fence *f = (struct grate_fence *)grate_fence_create(fence);
+
+   if (f)
+      f->fd = fd;
+   else if (fd >= 0)
+      close(fd);
+   return (struct pipe_fence_handle *)f;
+}
 
 struct pipe_fence_handle *
 grate_fence_create(struct drm_tegra_fence *fence)
@@ -277,6 +297,7 @@ grate_fence_create(struct drm_tegra_fence *fence)
    }
    pipe_reference_init(&f->reference, 1);
    f->fence = fence;
+   f->fd = -1;
    return (struct pipe_fence_handle *)f;
 }
 
@@ -291,6 +312,8 @@ grate_screen_fence_reference(struct pipe_screen *pscreen,
    if (pipe_reference(old ? &old->reference : NULL, f ? &f->reference : NULL)) {
       if (old->fence)
          drm_tegra_fence_free(old->fence);
+      if (old->fd >= 0)
+         close(old->fd);
       FREE(old);
    }
    *ptr = fence;
@@ -304,6 +327,11 @@ grate_screen_fence_finish(struct pipe_screen *screen,
 {
    struct grate_fence *f = (struct grate_fence *)fence;
    unsigned long ms;
+
+   if (f && !f->fence && f->fd >= 0)
+      return sync_wait(f->fd, timeout == OS_TIMEOUT_INFINITE ? -1 :
+                              (int)MIN2(DIV_ROUND_UP(timeout, 1000000),
+                                        INT32_MAX)) == 0;
 
    if (!f || !f->fence)
       return true;
@@ -319,6 +347,15 @@ grate_screen_fence_finish(struct pipe_screen *screen,
    drm_tegra_fence_free(f->fence);
    f->fence = NULL;
    return true;
+}
+
+static int
+grate_screen_fence_get_fd(struct pipe_screen *screen,
+                          struct pipe_fence_handle *fence)
+{
+   struct grate_fence *f = (struct grate_fence *)fence;
+
+   return f && f->fd >= 0 ? os_dupfd_cloexec(f->fd) : -1;
 }
 
 static const uint64_t grate_available_modifiers[] = {
@@ -406,11 +443,18 @@ grate_screen_create(int fd)
    /* fence functions */
    screen->base.fence_reference = grate_screen_fence_reference;
    screen->base.fence_finish = grate_screen_fence_finish;
+   screen->base.fence_get_fd = grate_screen_fence_get_fd;
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->base.nir_options[i] = &grate_nir_options;
 
    grate_init_screen_caps(&screen->base);
+   /* sync files of job fences: the channel UAPI's syncobjs */
+   if (drm_tegra_has_channel_uapi(screen->drm)) {
+      uint64_t cap = 0;
+      ((struct pipe_caps *)&screen->base.caps)->native_fence_fd =
+         drmGetCap(fd, DRM_CAP_SYNCOBJ, &cap) == 0 && cap;
+   }
    grate_init_shader_caps(&screen->base);
 
    grate_screen_resource_init(&screen->base);

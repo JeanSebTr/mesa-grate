@@ -61,6 +61,9 @@ struct drm_tegra;
 
 int drm_tegra_new(struct drm_tegra **drmp, int fd);
 void drm_tegra_close(struct drm_tegra *drm);
+int drm_tegra_get_fd(struct drm_tegra *drm);
+/* whether channels submit through the channel UAPI (known once one is open) */
+bool drm_tegra_has_channel_uapi(struct drm_tegra *drm);
 
 int drm_tegra_version(struct drm_tegra *drm);
 
@@ -124,6 +127,9 @@ int drm_tegra_channel_close(struct drm_tegra_channel *channel);
 int drm_tegra_job_new(struct drm_tegra_job **jobp,
 		      struct drm_tegra_channel *channel);
 int drm_tegra_job_free(struct drm_tegra_job *job);
+/* channel UAPI only: DRM syncobjs the job waits for / gets its fence in */
+void drm_tegra_job_set_syncobjs(struct drm_tegra_job *job,
+				uint32_t syncobj_in, uint32_t syncobj_out);
 int drm_tegra_job_submit(struct drm_tegra_job *job,
 			 struct drm_tegra_fence **fencep);
 

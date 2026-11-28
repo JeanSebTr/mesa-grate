@@ -77,6 +77,16 @@ struct grate_stream {
       unsigned num_bos, max_bos;
    } inflight[GRATE_STREAM_MAX_INFLIGHT];
    unsigned num_inflight;
+
+   /*
+    * Channel UAPI with DRM syncobjs: every job puts its fence in
+    * syncobj_out (exported as a sync file for native fences), and the next
+    * job waits for in_fence_fd (fences the client asked to wait for)
+    * through syncobj_in. 0 / -1 when not available.
+    */
+   int drm_fd;
+   uint32_t syncobj_out, syncobj_in;
+   int in_fence_fd;
 };
 
 struct grate_reloc {
@@ -125,6 +135,18 @@ grate_stream_submit(struct grate_stream *stream);
 /* A copy of the fence of the newest submitted job, or NULL if none runs. */
 struct drm_tegra_fence *
 grate_stream_last_fence(const struct grate_stream *stream);
+
+/* A sync file of the newest submitted job's fence, or -1. */
+int
+grate_stream_export_fence(struct grate_stream *stream);
+
+/* Make the next job wait for a sync file (ownership is not taken). */
+void
+grate_stream_wait_for(struct grate_stream *stream, int fd);
+
+/* Wait on the CPU for what the next job should have waited for. */
+void
+grate_stream_wait_in_fence(struct grate_stream *stream);
 
 /* Wait for every submitted job to complete. */
 int
